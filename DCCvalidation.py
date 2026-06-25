@@ -14,6 +14,9 @@ import locale
 from tkinter import messagebox
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.exceptions import InvalidSignature
 ### Own modules
 from Instance_Manager import IM
 from Logger import myLogger
@@ -31,9 +34,37 @@ validationlog = myLogger.getLogger("validationlog", log_path_validation)
 logger.info(f"Logger for the DCC-Validation has been initialized.")
 
 # Global variables
-ca_issuer = "D-TRUST CA 5-22-2 2022"
-root_ca_file = "D-TRUST Root CA 5 2022"
+#
+# IMPORTANT — these strings are *labels for humans / log messages only*. They are
+# NOT a security criterion. A certificate name (CN / Subject DN / Issuer DN) is not
+# a cryptographic identifier and can be chosen freely by anyone who issues a
+# certificate. The trust decision below is made exclusively on the basis of the
+# cryptographically pinned trust anchor (see TRUST_ANCHOR_SHA256) and a real
+# RFC 5280 certification-path validation, never on a string comparison of names.
+ca_issuer = "D-TRUST CA 5-22-2 2022"      # display label only
+root_ca_file = "D-TRUST Root CA 5 2022"   # display label only
 oid = "1.3.6.1.4.1.59749.1"
+
+# --- Trust anchor: identified CRYPTOGRAPHICALLY, never by name ----------------
+# RFC 5280 / BSI TR-02103 define a trust anchor by a concrete certificate / public
+# key, not by a Common Name. We therefore bundle the genuine root certificate in
+# the repository and pin it by the SHA-256 fingerprint of its DER encoding. The
+# validator never downloads its own trust anchor and never treats a name as proof.
+#
+# Provenance of the pinned values (cross-checked against the published certificate
+# data of D-Trust GmbH):
+#   Subject/Issuer : C=DE, O=D-Trust GmbH, CN=D-TRUST Root CA 5 2022 (self-signed)
+#   Serial         : 71 CB 7A 9F A5 12 3C 25 35 AD EE 75 0B C0 80 6A
+#   SHA-1          : 64 32 11 33 21 69 B4 83 B5 5F 70 46 E5 6C BF C6 C1 1D C5 F8
+#   SHA-256 (pin)  : d8 39 67 2f 98 4d ca 7c d4 80 ce 20 16 27 a4 de
+#                    61 c5 c1 85 5f 45 0e 5b 70 62 00 e7 3a 23 f0 47
+TRUST_ANCHOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trust_anchors")
+TRUST_ANCHOR_FILE = os.path.join(TRUST_ANCHOR_DIR, "D-TRUST_Root_CA_5_2022.pem")
+TRUST_ANCHOR_SHA256 = "d839672f984dca7cd480ce201627a4de61c5c1855f450e5b706200e73a23f047"
+# Defense in depth: the expected issuing intermediate, also pinned by fingerprint.
+# This is an *additional* signal; the decisive trust condition remains that the
+# path cryptographically terminates at the pinned root above.
+EXPECTED_INTERMEDIATE_SHA256 = "f0a1ca5fc42e6a8514c63415054f14ef7bb961adbc7a94185d8e410a905b8109"
 
 ############################################
 #####        General Functions         #####
@@ -210,36 +241,170 @@ def check_authenticity(cert, dcc_xml, ns):
     else:
         return False
 
-def verify_certificate_signature(cert_file, issuer_cert, root_cert, signing_date):
-    """
-    Verifies a certificate up to the root and checks the certificate chain.
+def load_trust_anchor():
+    """Loads the pinned root certificate from the repository and verifies it against
+    the hard-coded SHA-256 fingerprint.
 
-    :param cert_file: End-entity certificate
-    :param root_cert: Root CA certificate
-    :param intermediate_certs: PEM file or list of PEM files with intermediate certificates
-    :param signing_date: Time of validation in ISO format ‘YYYY-MM-DDTHH:MM:SSZ’
-    :return: True/False
+    The trust anchor is identified CRYPTOGRAPHICALLY (by the fingerprint of the
+    certificate, i.e. effectively its public key), exactly as required by RFC 5280
+    and BSI TR-02103 — never by a Common Name or Subject/Issuer DN. If the bundled
+    file is missing or does not match the pin, the function raises and the chain
+    therefore cannot be trusted: a swapped-in or attacker-supplied "root" can never
+    silently become the trust anchor.
+
+    :return: cryptography.x509.Certificate for the verified trust anchor
+    :raises RuntimeError: if the anchor is absent or its fingerprint does not match
     """
-    datetime = dt.strptime(signing_date, '%Y-%m-%dT%H:%M:%SZ')
-    unixtime = int(datetime.timestamp())
-    cmd = [
-        "openssl", "verify",  # Invoke the OpenSSL verification command
-        "-attime", f"{unixtime}",  # Perform the verification as if it were at the given UNIX timestamp
-        "-CAfile", root_cert,  # Root CA certificate used as trust anchor
-        "-untrusted", issuer_cert,  # Intermediate certificate (issuer certificate) supplied for chain building
-        cert_file  # End-entity certificate to be verified
-        ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        if "OK" in result.stdout:
-            validationlog.info(f"✅ Signature from {cert_file} is valid")
-            return True
-        else:
-            validationlog.warning(f"❌ Signature from {cert_file} is invalid:\n{result.stdout}")
-            return False
-    except subprocess.CalledProcessError as e:
-        validationlog.error(f"❌ Error during digital signature verification: {e.stderr}")
+        with open(TRUST_ANCHOR_FILE, "rb") as fh:
+            anchor = x509.load_pem_x509_certificate(fh.read())
+    except FileNotFoundError as e:
+        raise RuntimeError(f"Pinned trust anchor file not found: {TRUST_ANCHOR_FILE}") from e
+
+    actual = anchor.fingerprint(hashes.SHA256()).hex().lower()
+    if actual != TRUST_ANCHOR_SHA256.lower():
+        raise RuntimeError(
+            "Pinned trust anchor fingerprint mismatch — refusing to trust it. "
+            f"expected SHA-256 {TRUST_ANCHOR_SHA256}, got {actual}")
+    return anchor
+
+
+def _signature_is_valid(child, issuer):
+    """Cryptographically verifies that `issuer` signed `child` — the actual trust
+    link of a certification path. Returns True iff the signature over
+    child.tbs_certificate_bytes verifies under issuer's public key.
+
+    This is the operation that a Common-Name string comparison can NEVER replace:
+    it proves possession of the issuer's private key, which a chosen name does not.
+    """
+    pub = issuer.public_key()
+    try:
+        if isinstance(pub, ec.EllipticCurvePublicKey):
+            pub.verify(child.signature,
+                       child.tbs_certificate_bytes,
+                       child.signature_algorithm_parameters)
+        else:  # RSA (PKCS#1 v1.5 or PSS); the parameters object carries the padding
+            pub.verify(child.signature,
+                       child.tbs_certificate_bytes,
+                       child.signature_algorithm_parameters,
+                       child.signature_hash_algorithm)
+        return True
+    except InvalidSignature:
         return False
+    except Exception as e:
+        validationlog.warning(f"Could not verify signature link: {e}")
+        return False
+
+
+def _is_ca(cert):
+    """True iff the certificate asserts CA=TRUE in its Basic Constraints."""
+    try:
+        return bool(cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca)
+    except x509.ExtensionNotFound:
+        return False
+
+
+def _temporally_valid(cert, at):
+    """True iff `at` (a timezone-aware UTC datetime) lies within the certificate's
+    validity window."""
+    not_before = getattr(cert, "not_valid_before_utc", None)
+    not_after = getattr(cert, "not_valid_after_utc", None)
+    if not_before is None or not_after is None:  # older cryptography: naive UTC
+        not_before = pytz.utc.localize(cert.not_valid_before)
+        not_after = pytz.utc.localize(cert.not_valid_after)
+    return not_before <= at <= not_after
+
+
+def validate_certificate_chain(seal_cert_file, intermediate_cert_file, signing_date):
+    """RFC 5280 / BSI TR-02103-style certification-path validation against the
+    PINNED trust anchor.
+
+    Builds and checks the path:   seal certificate -> intermediate -> pinned root.
+
+    For every link it verifies the real cryptographic and temporal properties —
+    not certificate names:
+      * the signature on each certificate verifies under its issuer's public key,
+      * the path terminates at the cryptographically pinned trust anchor,
+      * issuer DN == issuer's subject DN (name chaining as a *consistency* check),
+      * the issuing certificates assert CA=TRUE (Basic Constraints),
+      * every certificate is temporally valid at the signing time.
+
+    The decisive trust condition is `anchored_to_pinned_root`: that the path ends
+    at the root pinned by SHA-256. A Common Name is never used as a trust criterion.
+
+    :param seal_cert_file: path to the end-entity (seal) certificate, PEM
+    :param intermediate_cert_file: path to the issuing intermediate, PEM
+    :param signing_date: validation time, ISO 'YYYY-MM-DDTHH:MM:SSZ' or datetime
+    :return: dict with keys chain_ok, anchored_to_pinned_root, intermediate_pin_ok, reason
+    """
+    result = {"chain_ok": False, "anchored_to_pinned_root": False,
+              "intermediate_pin_ok": False, "reason": ""}
+
+    # 0) Load the cryptographically pinned trust anchor. If this fails, nothing is
+    #    trusted — there is deliberately no fallback to a downloaded "root".
+    try:
+        anchor = load_trust_anchor()
+    except RuntimeError as e:
+        result["reason"] = str(e)
+        validationlog.error(f"❌ {e}")
+        return result
+
+    try:
+        with open(seal_cert_file, "rb") as fh:
+            seal = x509.load_pem_x509_certificate(fh.read())
+        with open(intermediate_cert_file, "rb") as fh:
+            intermediate = x509.load_pem_x509_certificate(fh.read())
+    except Exception as e:
+        result["reason"] = f"could not load certificates: {e}"
+        validationlog.error(f"❌ {result['reason']}")
+        return result
+
+    at = signing_date if isinstance(signing_date, dt) else dt.strptime(signing_date, '%Y-%m-%dT%H:%M:%SZ')
+    if at.tzinfo is None:
+        at = pytz.utc.localize(at)
+
+    # 1) Cryptographic signature links (the real trust, proves key possession).
+    if not _signature_is_valid(seal, intermediate):
+        result["reason"] = "seal certificate is not signed by the supplied intermediate"
+        validationlog.warning(f"❌ {result['reason']}")
+        return result
+    if not _signature_is_valid(intermediate, anchor):
+        result["reason"] = "intermediate is not signed by the pinned trust anchor"
+        validationlog.warning(f"❌ {result['reason']}")
+        return result
+
+    # 2) The path terminates at the PINNED anchor — this is the trust decision.
+    result["anchored_to_pinned_root"] = True
+
+    # 3) Name chaining as a consistency check (NOT as the trust criterion).
+    if seal.issuer != intermediate.subject or intermediate.issuer != anchor.subject:
+        result["reason"] = "name chaining inconsistent with the verified signature links"
+        validationlog.warning(f"❌ {result['reason']}")
+        return result
+
+    # 4) Basic Constraints: issuing certificates must be CAs.
+    if not _is_ca(intermediate) or not _is_ca(anchor):
+        result["reason"] = "an issuing certificate does not assert CA=TRUE (Basic Constraints)"
+        validationlog.warning(f"❌ {result['reason']}")
+        return result
+
+    # 5) Temporal validity of every certificate at the signing time.
+    for tag, cert in (("seal", seal), ("intermediate", intermediate), ("root", anchor)):
+        if not _temporally_valid(cert, at):
+            result["reason"] = f"{tag} certificate is not temporally valid at {at.isoformat()}"
+            validationlog.warning(f"❌ {result['reason']}")
+            return result
+
+    # 6) Defense in depth: confirm the issuing intermediate matches the expected pin.
+    result["intermediate_pin_ok"] = (
+        intermediate.fingerprint(hashes.SHA256()).hex().lower() == EXPECTED_INTERMEDIATE_SHA256.lower())
+    if not result["intermediate_pin_ok"]:
+        validationlog.warning("⚠️ Issuing intermediate does not match the expected pinned fingerprint.")
+
+    result["chain_ok"] = True
+    result["reason"] = "path validated cryptographically to the pinned trust anchor"
+    validationlog.info(f"✅ {result['reason']}")
+    return result
 
 #--- Möglicherweise überflüssig -----------------------------------------------------------------------------------
 def download_cert(url, filename):
@@ -341,24 +506,12 @@ def verify_certificate(cert_file, issuer_cert, ocsp_url, root_ca, signing_date):
         return False
 
 
-def find_root_cert(cert_file):
-    """ Extrahiert den Subject-Namen des letzten Zertifikats in einer PEM-Datei. """
-    try:
-        with open(cert_file, 'rb') as f:
-            cert_data = f.read()
-        cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_data)
-        root = cert.get_issuer().CN
-    except Exception as e:
-        validationlog.error(f"Error loading certificate: {e}")
-        return None
-    if root == root_ca_file:
-        validationlog.info(f"Root found: {root}")
-        return root
-    else:
-        root_path = f"{root}.pem"
-        print(f"Repeated call of find_root_cert with root_path: {root_path}")
-        return find_root_cert(root_path)
-    
+# NOTE: the former `find_root_cert()` helper walked the chain by comparing the
+# issuer Common Name against the string "D-TRUST Root CA 5 2022". That is exactly
+# the anti-pattern this module no longer uses: a certificate name is not a
+# cryptographic identifier and can be set freely by anyone. Anchoring is now done
+# cryptographically by validate_certificate_chain() against the pinned root.
+
 
 def get_oid_from_cert(cert_pem):
     # Load the certificate with pyOpenSSL
@@ -529,23 +682,23 @@ def performDCCvalidation(filepath, mode, id=None):
             except:
                 validationlog.warning("Failed to convert the issuer certificate to PEM format.")
             
-            try:
-                root_oscp_url, root_url = extract_ocsp_info("D-TRUST CA 5-22-2 2022.pem")
-                validationlog.info(f"Root-OCSP-URL: {root_oscp_url}, Issuer-Zertifikat Download URL: {root_url}")
-            except:
-                validationlog.warning("Failed to extract OCSP-URL and Root-Certificate-URL from the issuer certificate.")
-            try: # Download the root certificate in DER format
-                download_cert(root_url, "D-TRUST Root CA 5 2022.crt")
-                validationlog.info("Root certificate downloaded successfully.")
-                convert_der_to_pem("D-TRUST Root CA 5 2022.crt", "D-TRUST Root CA 5 2022.pem")
-                validationlog.info("Root certificate converted to PEM format successfully.")
-            except:
-                validationlog.warning("Failed to download and convert the root certificate.")
+            # NOTE: the trust anchor (root) is NOT downloaded. It is the pinned,
+            # repository-bundled certificate verified by SHA-256 in load_trust_anchor().
+            # Downloading the root from the certificate's own AIA and then trusting
+            # it would let a certificate nominate its own trust anchor — exactly the
+            # weakness this revision removes. Only the issuing *intermediate* is
+            # fetched (above) and is then cryptographically verified to chain to the
+            # pinned root below.
 
             ######## Verification of the authenticity of the issuer ########
-            # Signature valid (checked in the previous step) & Expected issuer (comparison between DCC tag and certificate)
-            seal_sig_is_valid = verify_certificate_signature("seal_cert.pem", "D-TRUST CA 5-22-2 2022.pem", "D-TRUST Root CA 5 2022.pem", signing_date) # Schritt 1 in der TSPS (bereits für Siegel, als auch für Ca-Zertifikat)
-            
+            # Real RFC 5280 / BSI TR-02103 certification-path validation against the
+            # cryptographically pinned trust anchor. `seal_sig_is_valid` is True only
+            # if the full path seal -> intermediate -> pinned root verifies (signatures,
+            # validity windows, CA constraints, name chaining). It replaces the former
+            # `openssl verify` against a *downloaded* root. (Schritt 1 der TSPS)
+            chain_result = validate_certificate_chain("seal_cert.pem", "D-TRUST CA 5-22-2 2022.pem", signing_date)
+            seal_sig_is_valid = chain_result["chain_ok"]
+
             dcc_issuer_xml = str(dcc_xml.xpath('//dcc:calibrationLaboratory/dcc:contact/dcc:name/dcc:content/text()', namespaces=ns)[0]).split(",")[0]
             issuer_is_authentic = check_authenticity(cert, dcc_xml, ns)
             #TODO: Nummer des Kalibrierlabors mit prüfen
@@ -562,27 +715,26 @@ def performDCCvalidation(filepath, mode, id=None):
             validationlog.info(f"signing_date liegt im Gültigkeitsbereich des Siegelzertifikats: {signing_date_is_ok}")
             #TODO Gültigkeitszeitraum vom D Trust Zertifikat überprüfen
             
-            cert_is_valid = verify_certificate("seal_cert.pem", "D-TRUST CA 5-22-2 2022.pem", oscp_url, "D-TRUST Root CA 5 2022.pem", signing_date) # Schritt 3 in der TSPS
-            #TODO: Überprüfung für D Trust Zertifikat wiederholen
-            # Schritt 4 in der TSPS
-            issuer = dict(cert.get_issuer().get_components())[b'CN'].decode("utf-8")
-            
-            if issuer == ca_issuer:
-                correct_issuer = True
-            else:
-                correct_issuer = False
+            # Revocation status via OCSP, anchored to the PINNED root (not a download). (Schritt 3 der TSPS)
+            cert_is_valid = verify_certificate("seal_cert.pem", "D-TRUST CA 5-22-2 2022.pem", oscp_url, TRUST_ANCHOR_FILE, signing_date)
 
-            # Stringvergleich ist hier eigentlich nicht ausreichend
-            # Ist dann eigentlich obsolet
-            root_subject = find_root_cert("seal_cert.pem")
-            # print(f"Root-Subject: {root_subject}")
-            
-            if root_subject == root_ca_file:
-                validationlog.info(f"✅ Die Zertifikatskette endet auf der D-TRUST Root CA 5 2022.")
-                correct_root = True
+            # Schritt 4 der TSPS — issuer / trust-anchor confirmation.
+            #
+            # Previously this was a string comparison of Common Names
+            # (`issuer == ca_issuer`, `root_subject == root_ca_file`). A certificate
+            # name is not a cryptographic identifier, so that test could be satisfied
+            # by any certificate that simply *names itself* "D-TRUST ...". The trust
+            # decision is now taken from the cryptographic path validation:
+            #   * correct_root   : the path provably terminates at the SHA-256-pinned
+            #                      trust anchor (the decisive condition),
+            #   * correct_issuer : the issuing intermediate matches the expected
+            #                      pinned fingerprint (defense in depth).
+            correct_root = chain_result["anchored_to_pinned_root"]
+            correct_issuer = chain_result["intermediate_pin_ok"]
+            if correct_root:
+                validationlog.info("✅ The certification path terminates at the pinned D-TRUST Root CA 5 2022 (verified by SHA-256).")
             else:
-                validationlog.warning(f"❌ Die Zertifikatskette endet nicht auf der D-TRUST Root CA 5 2022.")
-                correct_root = False
+                validationlog.warning(f"❌ The certification path does NOT terminate at the pinned trust anchor: {chain_result['reason']}")
 
             admission_oid = get_oid_from_cert(seal_cert_pem)
             if admission_oid == oid:

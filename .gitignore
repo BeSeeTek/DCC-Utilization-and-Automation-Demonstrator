@@ -4,3 +4,8 @@
 *.pem
 .venv/
 __pycache__/
+
+# Exceptions: pinned trust material is part of the trusted code base and MUST be
+# versioned and reviewed. These are public CA certificates, not secrets.
+!trust_anchors/*.pem
+!tests/fixtures/*.pem
