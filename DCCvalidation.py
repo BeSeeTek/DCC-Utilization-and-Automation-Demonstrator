@@ -56,8 +56,16 @@ oid = "1.3.6.1.4.1.59749.1"
 #   Subject/Issuer : C=DE, O=D-Trust GmbH, CN=D-TRUST Root CA 5 2022 (self-signed)
 #   Serial         : 71 CB 7A 9F A5 12 3C 25 35 AD EE 75 0B C0 80 6A
 #   SHA-1          : 64 32 11 33 21 69 B4 83 B5 5F 70 46 E5 6C BF C6 C1 1D C5 F8
-#   SHA-256 (pin)  : d8 39 67 2f 98 4d ca 7c d4 80 ce 20 16 27 a4 de
-#                    61 c5 c1 85 5f 45 0e 5b 70 62 00 e7 3a 23 f0 47
+#   SHA-256 (pin)  : D8:39:67:2F:98:4D:CA:7C:D4:80:CE:20:16:27:A4:DE:
+#                    61:C5:C1:85:5F:45:0E:5B:70:62:00:E7:3A:23:F0:47
+#
+# Verify the bundled anchor independently (the printed value, with the colons
+# removed and lower-cased, must equal TRUST_ANCHOR_SHA256 below):
+#   openssl x509 -in trust_anchors/D-TRUST_Root_CA_5_2022.pem -noout -fingerprint -sha256
+# As a one-liner that yields exactly the TRUST_ANCHOR_SHA256 string:
+#   openssl x509 -in trust_anchors/D-TRUST_Root_CA_5_2022.pem -noout -fingerprint -sha256 \
+#     | sed 's/.*=//' | tr -d ':' | tr 'A-Z' 'a-z'
+# The SHA-1 / serial above can be eyeball-compared against any certificate viewer.
 TRUST_ANCHOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trust_anchors")
 TRUST_ANCHOR_FILE = os.path.join(TRUST_ANCHOR_DIR, "D-TRUST_Root_CA_5_2022.pem")
 TRUST_ANCHOR_SHA256 = "d839672f984dca7cd480ce201627a4de61c5c1855f450e5b706200e73a23f047"
