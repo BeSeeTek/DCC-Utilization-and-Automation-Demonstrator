@@ -1,35 +1,60 @@
-# Certificate Path Validation — Flaw Analysis and Corrected Implementation
+# Certificate Path Validation — Analysis and Corrected Implementation
 
 **Component:** `DCCvalidation.py` (Digital Calibration Certificate validation)
 **Scope:** Trust-anchor handling and X.509 certification-path validation
-**Normative basis:** RFC 5280, BSI TR-02103, DAkkS-TSPS Chapter 8 / 8.4
+**Normative basis:** RFC 5280, BSI TR-02103, DAkkS-TSPS Chapter 8 / 8.1 / 8.4
 **Status:** Fixed. Covered by `tests/test_certificate_path_validation.py`.
 
 ---
 
 ## 1. Summary
 
-Earlier revisions of `DCCvalidation.py` decided whether a DCC was issued under a
-valid D-Trust accreditation in part by **comparing certificate names as strings**
-and by validating the certificate chain against a **root certificate downloaded
-at runtime from the certificate under test**. Neither a certificate name nor a
-self-supplied root is a cryptographic identifier of a trust anchor.
+Earlier revisions of `DCCvalidation.py` established a DCC's accreditation in part
+by **comparing certificate names as strings** and by validating the certificate
+chain against a **root certificate obtained at runtime from the certificate under
+test**.
 
-This document explains, in a deliberately non-adversarial and constructive way,
-why those two patterns are not sufficient under RFC 5280 / BSI TR-02103, and how
-the corrected implementation establishes trust cryptographically. The goal is to
-turn the demonstrator into a *correct reference* for trust-anchor handling in the
-DCC ecosystem.
+It matters where this comes from: **the implementation faithfully followed the
+DAkkS-TSPS.** TSPS v1.5 (Chapter 8 / 8.4) defines the relevant trust anchor *by
+name* — the certificate must have been "issued by the CA 'D-TRUST CA 5-22-2 2022'
+and the certification path must refer to the Root-CA 'D-TRUST Root CA 5 2022'",
+which "applies as the trust anchor for the purposes of the DAkkS". The TSPS gives
+**no cryptographic identifier** (certificate, public key, or fingerprint) for that
+anchor. A name string is therefore the only anchor description an implementer is
+handed.
 
-The corrected design follows directly from the principle that RFC 5280 and
-BSI TR-02103 already state: **a trust anchor is a specific certificate / public
-key, not a name.**
+The difficulty is that the **same TSPS** (Chapter 8.1) simultaneously requires
+conformance to **BSI TR-02103 and RFC 5280**, which define a trust anchor as a
+specific certificate / public key — *not* a name. The specification is thus
+internally inconsistent: a literal, TSPS-compliant reading of Chapter 8 / 8.4
+produces exactly the name-based check that Chapter 8.1 forbids. The BAM
+demonstrator complied with the letter of Chapter 8 / 8.4 while, as a direct
+consequence of that wording, not conforming to the RFC 5280 / BSI TR-02103
+requirement of the same document. **The root cause is the specification, not the
+implementation.**
+
+This document explains, constructively, the two resulting patterns, why they do
+not satisfy RFC 5280 / BSI TR-02103, and how the corrected implementation resolves
+the inconsistency by anchoring trust cryptographically — which also fulfils the
+*intent* of the TSPS. The aim is to turn the demonstrator into a *correct
+reference* for trust-anchor handling in the DCC ecosystem and to support the
+requested TSPS clarification.
+
+The corrected design follows the principle that RFC 5280 and BSI TR-02103 already
+state, and that the TSPS should adopt explicitly: **a trust anchor is a specific
+certificate / public key, not a name.**
 
 ---
 
-## 2. The two flaws
+## 2. The two patterns — and why a TSPS-compliant reading produces them
 
-### Flaw A — The trust anchor was not pinned (downloaded from the certificate itself)
+Both patterns below follow directly from the TSPS describing the trust anchor only
+by name. Because no certificate or fingerprint is given, an implementer has nothing
+to pin to; matching the *name* of the CA and root — and obtaining those
+certificates dynamically in order to read their names — is the path of least
+resistance the specification leaves open.
+
+### Pattern A — The trust anchor was not pinned (obtained from the certificate itself)
 
 The original flow obtained both the issuing intermediate **and the root** by
 following the Authority Information Access (AIA) URLs found *inside the very
@@ -56,11 +81,16 @@ Because the AIA URLs are attacker-controllable fields of an attacker-supplied
 certificate, a forged certificate can nominate **its own** root. `openssl verify`
 then correctly reports that the forged chain is internally consistent — it is, but
 only with respect to a trust anchor the attacker chose. **No step bound the
-validation to the *genuine* D-TRUST Root CA 5 2022.** This is the root cause: a
-path validation is only as meaningful as the anchor it terminates at, and the
-anchor was not fixed.
+validation to the *genuine* D-TRUST Root CA 5 2022.** A path validation is only as
+meaningful as the anchor it terminates at, and the anchor was not fixed.
 
-### Flaw B — Certificate *names* were used as a security criterion
+This dynamic fetching is not itself demanded by the TSPS — but the TSPS leaves it
+as the natural option: having defined the anchor only by a name, it provides no
+certificate to pin, so the root is sourced at runtime and recognised by its name.
+Fix the specification gap (give a cryptographic anchor) and this pattern has no
+reason to exist.
+
+### Pattern B — Certificate *names* were used as a security criterion (as Chapter 8 / 8.4 describes the anchor)
 
 After the chain check, the decision used string comparisons of Common Names:
 
@@ -75,21 +105,28 @@ if root_subject == root_ca_file:        # root_ca_file = "D-TRUST Root CA 5 2022
     correct_root = True
 ```
 
-A Common Name / Subject DN / Issuer DN is a freely chosen attribute. Anyone can
-generate a self-signed certificate whose CN is exactly `D-TRUST Root CA 5 2022`.
-Therefore these comparisons can be satisfied by a certificate that has nothing to
-do with D-Trust. The in-code comment `# Stringvergleich ist hier eigentlich nicht
-ausreichend` correctly anticipated this.
+This mirrors the TSPS wording one-to-one: the constants `ca_issuer =
+"D-TRUST CA 5-22-2 2022"` and `root_ca_file = "D-TRUST Root CA 5 2022"` are exactly
+the names Chapter 8 / 8.4 uses to describe the anchor. A Common Name / Subject DN /
+Issuer DN is, however, a freely chosen attribute: anyone can generate a self-signed
+certificate whose CN is exactly `D-TRUST Root CA 5 2022`, so these comparisons can
+be satisfied by a certificate that has nothing to do with D-Trust. Notably, the
+in-code comment `# Stringvergleich ist hier eigentlich nicht ausreichend` shows the
+implementers were **themselves aware** that a string comparison is insufficient —
+consistent with conscientiously following a specification that prescribed a name
+while also referencing RFC 5280.
 
-### Why this matters under RFC 5280 / BSI TR-02103
+### Why this matters under RFC 5280 / BSI TR-02103 (which TSPS Chapter 8.1 mandates)
 
-RFC 5280 §6 ("Certification Path Validation") defines validation as a
-cryptographic procedure that terminates at a **trust anchor**, where a trust
-anchor is a *trusted public key* (with associated name and constraints) — not a
-name used as a lookup key. BSI TR-02103 follows the same model. A name match is,
-at most, a consistency check on top of a completed cryptographic validation; it is
-never a substitute for it. Flaws A and B together meant the decisive trust step
-relied on attacker-influenceable data.
+TSPS Chapter 8.1 explicitly requires conformance to BSI TR-02103 and RFC 5280.
+RFC 5280 §6 ("Certification Path Validation") defines validation as a cryptographic
+procedure that terminates at a **trust anchor**, where a trust anchor is a *trusted
+public key* (with associated name and constraints) — not a name used as a lookup
+key. BSI TR-02103 follows the same model. A name match is, at most, a consistency
+check on top of a completed cryptographic validation; it is never a substitute for
+it. Patterns A and B together meant the decisive trust step relied on
+attacker-influenceable data — which is why Chapter 8 / 8.4 and Chapter 8.1 of the
+TSPS cannot both be satisfied by a name-based reading.
 
 ---
 
@@ -184,13 +221,27 @@ explicitly documented as non-security.
 
 ---
 
-## 5. Relationship to the DAkkS-TSPS clarification request
+## 5. Relationship to the DAkkS-TSPS and the clarification request
 
-This change implements, at the level of code, the same principle requested for the
-TSPS text: that the trust anchor be defined by **cryptographic identifiers** and
-that certificate names not be used as a substitute for RFC 5280 / BSI TR-02103
-certification-path validation. The demonstrator now serves as a concrete,
-testable example of the recommended approach rather than of the pitfall.
+To be explicit about responsibility: the root cause is the **specification**, not
+the implementation. TSPS v1.5 Chapter 8 / 8.4 defines the trust anchor by name,
+while Chapter 8.1 requires RFC 5280 / BSI TR-02103, which require a *cryptographic*
+anchor. Those two cannot both be satisfied literally. The BAM demonstrator followed
+Chapter 8 / 8.4 and is, in that sense, **TSPS-compliant**; what it could not also be
+— given the same wording — is conformant to Chapter 8.1. This change additionally
+satisfies Chapter 8.1 by identifying the anchor cryptographically.
+
+This is exactly the clarification requested of the DAkkS: that the TSPS define the
+trust anchor by **cryptographic identifiers**, and state that certificate names
+(CN / Subject DN / Issuer DN) must not be used as a substitute for RFC 5280 /
+BSI TR-02103 certification-path validation. Until the TSPS is amended, this
+implementation resolves the inconsistency in favour of the higher-ranking normative
+references (RFC 5280 / BSI TR-02103) while still honouring the TSPS *intent* of
+anchoring on the genuine D-TRUST Root CA 5 2022. Where the TSPS text and the
+RFC/BSI requirement conflict, an implementation that aims to be secure should follow
+the latter and document the deviation — as done here. The demonstrator thereby
+becomes a concrete, testable example of the recommended approach rather than of the
+pitfall the specification currently invites.
 
 ---
 
