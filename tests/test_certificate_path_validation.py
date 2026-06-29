@@ -67,6 +67,13 @@ INTERMEDIATE = os.path.join(FIXTURES, "D-TRUST_CA_5-22-2_2022.pem")
 
 
 def _write_seal(tmp_path):
+    """Extract the REAL BAM seal certificate from a sample DCC and write it as PEM.
+
+    Pulls the base64 X509Certificate out of the DCC's XML signature and wraps it in
+    PEM armor exactly as the production get_signature_details() does, so the tests
+    run against a genuine, in-the-wild certificate rather than a synthetic one.
+    Returns (path_to_pem, parsed_certificate).
+    """
     root = etree.parse(SAMPLE_DCC).getroot()
     b64 = root.xpath("//dsig:X509Certificate", namespaces=DSIG)[0].text.strip()
     pem = f"-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----".encode()
@@ -77,6 +84,13 @@ def _write_seal(tmp_path):
 
 
 def _self_signed(cn, key, issuer_key, issuer_name, ca):
+    """Tiny certificate factory used to forge attacker certificates.
+
+    Builds a cert with subject "C=DE, O=D-Trust GmbH, CN=<cn>", a fixed 2023-2035
+    validity window, the requested BasicConstraints(ca=...), signed with issuer_key.
+    Passing issuer_key == key and issuer_name == its own name yields a self-signed
+    root; otherwise an issued (chained) certificate. Returns (cert, name).
+    """
     nb = datetime.datetime(2023, 1, 1, tzinfo=datetime.timezone.utc)
     na = datetime.datetime(2035, 1, 1, tzinfo=datetime.timezone.utc)
     name = x509.Name([
@@ -95,6 +109,18 @@ def _self_signed(cn, key, issuer_key, issuer_name, ca):
 
 
 def test_genuine_chain_validates(tmp_path_factory=None):
+    """POSITIVE case: a genuine DCC must still validate end-to-end.
+
+    A real seal certificate + the genuine intermediate must validate to the pinned
+    root. The validation time is set inside every certificate's validity window.
+    This guards against a "fix" that merely rejects everything: it proves the new
+    code does not produce false negatives on legitimate, correctly-issued DCCs.
+
+    Asserts:
+      * chain_ok                -> full path seal->intermediate->pinned root verifies
+      * anchored_to_pinned_root -> the path terminates at the SHA-256-pinned root
+      * intermediate_pin_ok     -> the issuer matches the expected pinned intermediate
+    """
     tmp = _mk_tmp(tmp_path_factory, "genuine")
     seal_path, seal = _write_seal(tmp)
     at = seal.not_valid_before_utc + datetime.timedelta(days=1)
@@ -105,6 +131,26 @@ def test_genuine_chain_validates(tmp_path_factory=None):
 
 
 def test_name_spoofing_attacker_chain_rejected(tmp_path_factory=None):
+    """SECURITY case: a chain that only *names itself* D-TRUST must be rejected.
+
+    Reconstructs the exact attack the previous (name-based) logic was vulnerable to.
+    A complete, internally-consistent attacker chain is built from fresh keys:
+        evil self-signed root  CN="D-TRUST Root CA 5 2022"
+          -> evil intermediate CN="D-TRUST CA 5-22-2 2022"
+            -> evil seal        (named after the BAM laboratory)
+    Every certificate carries the genuine *names* but none of the genuine *keys*.
+
+    The assertions are deliberately two-part:
+      1. Prove the OLD checks WOULD have accepted it — the leaf issuer CN equals
+         V.ca_issuer and the fake root subject CN equals V.root_ca_file. This makes
+         the test a faithful proof of the real vulnerability, not a strawman.
+      2. Prove the NEW validation REJECTS it (chain_ok / anchored_to_pinned_root are
+         False) — because the fake intermediate is not signed by the SHA-256-pinned
+         genuine root. Names match; cryptography does not.
+
+    This is the permanent regression guard: if a CN-based shortcut is ever
+    reintroduced, this test fails.
+    """
     tmp = _mk_tmp(tmp_path_factory, "attacker")
     rk = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     root, root_name = _self_signed("D-TRUST Root CA 5 2022", rk, rk,
@@ -122,10 +168,12 @@ def test_name_spoofing_attacker_chain_rejected(tmp_path_factory=None):
     with open(inter_path, "wb") as fh:
         fh.write(inter.public_bytes(serialization.Encoding.PEM))
 
-    # The former string checks WOULD have accepted this chain:
+    # Part 1 — the former string checks WOULD have accepted this chain:
     assert seal.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value == V.ca_issuer
     assert root.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value == V.root_ca_file
 
+    # Part 2 — the cryptographic validation rejects it: the fake intermediate is
+    # not signed by the pinned genuine root, so the path is not anchored.
     at = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
     res = V.validate_certificate_chain(seal_path, inter_path, at)
     assert res["chain_ok"] is False
@@ -133,6 +181,14 @@ def test_name_spoofing_attacker_chain_rejected(tmp_path_factory=None):
 
 
 def test_tampered_pin_refuses():
+    """INTEGRITY case: a mismatching pin must hard-fail, with no silent fallback.
+
+    Temporarily replaces the expected fingerprint with an all-zero value and checks
+    that load_trust_anchor() raises RuntimeError instead of trusting whatever PEM is
+    on disk. The original constant is restored in `finally` so the mutation cannot
+    leak into the other tests. This protects the single piece of trusted material
+    the whole scheme rests on: even a swapped bundled root is rejected on mismatch.
+    """
     original = V.TRUST_ANCHOR_SHA256
     try:
         V.TRUST_ANCHOR_SHA256 = "00" * 32
@@ -147,6 +203,8 @@ def test_tampered_pin_refuses():
 
 
 def _name(cn):
+    """Build a "C=DE, O=D-Trust GmbH, CN=<cn>" X.509 name (used where only a name,
+    not a full certificate, is required)."""
     return x509.Name([
         x509.NameAttribute(NameOID.COUNTRY_NAME, "DE"),
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "D-Trust GmbH"),
@@ -155,12 +213,17 @@ def _name(cn):
 
 
 def _mk_tmp(factory, label):
+    """Return a temp directory. Under pytest the tmp_path_factory fixture is passed
+    and used; when the file is run directly (factory is None) it falls back to
+    tempfile.mkdtemp. This is why each test takes `tmp_path_factory=None`."""
     if factory is not None:
         return str(factory.mktemp(label))
     import tempfile
     return tempfile.mkdtemp(prefix=f"dcc_{label}_")
 
 
+# Allow running without pytest: execute each test, print PASS/FAIL, exit non-zero
+# on any failure (so it doubles as a standalone, CI-friendly check).
 if __name__ == "__main__":
     failures = 0
     for fn in (test_genuine_chain_validates,
