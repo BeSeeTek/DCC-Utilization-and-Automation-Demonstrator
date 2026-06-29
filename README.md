@@ -18,7 +18,7 @@ Users needing to analyze temperature sensor measurements with automated correcti
 | Feature | Description |
 |---------|-------------|
 | Sensor Data Visualization | Each sensor has its own tab showing raw and corrected measurements side by side. |
-| DCC Validation | Schema validation against XSD, integrity check after sealing, and RFC 5280 / BSI TR-02103 certification-path validation up to a **cryptographically pinned** trust anchor. |
+| DCC Validation | Schema validation against XSD, integrity check after sealing, and full certificate chain verification up to the root certificate. |
 | Dynamic Plotting | Real-time updating plots for up to 4 sensors. |
 | Drag-and-Drop XML Loading | Load DCC files directly into the GUI for quick and fully automated analysis. |
 |Interactive GUI | Message boxes for decisions regarding the usage of the DCC and Treeview widgets for structured data display. |
@@ -31,25 +31,6 @@ Users needing to analyze temperature sensor measurements with automated correcti
 - The DCC is validated against the schema, checked for post-sealing modifications, and the certificate chain is verified.
 
 - Sensor measurements are displayed in dynamic plots with a side-by-side comparison: raw vs. DCC-corrected.
-
-
-🔐 **Certificate Validation & Trust Anchor**
-
-DCC accreditation is established by an RFC 5280 / BSI TR-02103 certification-path
-validation that terminates at a **cryptographically pinned** trust anchor — the
-genuine *D-TRUST Root CA 5 2022*, bundled in [`trust_anchors/`](trust_anchors/)
-and verified by its SHA-256 fingerprint at load time. The trust decision is made
-on cryptographic identifiers (signatures, fingerprints), **never** on a
-comparison of certificate names (Common Name / Subject DN / Issuer DN), since a
-name is not a cryptographic identifier.
-
-This implements, in code, the principle that a trust anchor is a specific
-certificate / public key rather than a name. The design, the issues it addresses,
-and the reasoning are documented in
-[`SECURITY_FIX_ANALYSIS.md`](SECURITY_FIX_ANALYSIS.md), and guarded by the offline
-regression tests in
-[`tests/test_certificate_path_validation.py`](tests/test_certificate_path_validation.py)
-(run with `python tests/test_certificate_path_validation.py`).
 
 
 ⚙️ **Installation**
