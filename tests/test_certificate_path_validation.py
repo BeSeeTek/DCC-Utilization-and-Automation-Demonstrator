@@ -16,6 +16,9 @@ What is proven here:
      `root_subject == root_ca_file`) but must never be trusted.
   3. Tampering with the pinned anchor (wrong fingerprint) makes the anchor refuse
      to load — there is no fallback to an unverified certificate.
+  4. A missing or malformed anchor FILE falls back to the embedded, pin-checked
+     backup copy instead of crashing — a packaging mishap cannot disable validation.
+  5. The embedded backup never drifts from the bundled file (same fingerprint).
 """
 import os
 import sys
@@ -202,30 +205,44 @@ def test_tampered_pin_refuses():
         V.TRUST_ANCHOR_SHA256 = original
 
 
-def test_malformed_anchor_refuses(tmp_path_factory=None):
-    """INTEGRITY case: a present-but-unparseable anchor must fail gracefully.
+def test_malformed_file_falls_back_to_embedded(tmp_path_factory=None):
+    """RESILIENCE case: a missing/malformed anchor FILE must fall back, not crash.
 
-    Points the anchor path at a file containing garbage (valid path, invalid PEM)
-    and checks that load_trust_anchor() raises RuntimeError — not a raw ValueError
-    that would escape validate_certificate_chain() and crash the caller. This guards
-    the funnel that turns every anchor-load failure into a structured validation
-    reason. The original path is restored in `finally`.
+    Points the anchor path first at a garbage PEM and then at a non-existent path,
+    and checks that load_trust_anchor() still returns the genuine, pin-matching
+    anchor by using the embedded in-source backup (TRUST_ANCHOR_PEM). This proves a
+    packaging/deployment mishap that loses or corrupts the bundled file cannot
+    disable validation — the pin-checked backstop takes over. Path restored in
+    `finally`.
     """
+    original = V.TRUST_ANCHOR_FILE
     tmp = _mk_tmp(tmp_path_factory, "malformed")
     bad = os.path.join(tmp, "garbage.pem")
     with open(bad, "wb") as fh:
         fh.write(b"-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----\n")
-    original = V.TRUST_ANCHOR_FILE
     try:
-        V.TRUST_ANCHOR_FILE = bad
-        raised = False
-        try:
-            V.load_trust_anchor()
-        except RuntimeError:
-            raised = True
-        assert raised, "load_trust_anchor must raise RuntimeError on a malformed anchor"
+        for path in (bad, os.path.join(tmp, "does_not_exist.pem")):
+            V.TRUST_ANCHOR_FILE = path
+            anchor = V.load_trust_anchor()  # must not raise
+            fp = anchor.fingerprint(hashes.SHA256()).hex().lower()
+            assert fp == V.TRUST_ANCHOR_SHA256.lower(), "fallback anchor must match the pin"
     finally:
         V.TRUST_ANCHOR_FILE = original
+
+
+def test_embedded_backup_matches_bundled_file():
+    """DRIFT guard: the embedded backup must equal the bundled PEM file.
+
+    Both copies of the root must be byte-equivalent (same certificate), so the
+    in-source backstop can never silently diverge from the human-inspectable file.
+    Compares their SHA-256 fingerprints; both must also equal the pin.
+    """
+    file_cert = x509.load_pem_x509_certificate(open(V.TRUST_ANCHOR_FILE, "rb").read())
+    embedded = x509.load_pem_x509_certificate(V.TRUST_ANCHOR_PEM.encode())
+    file_fp = file_cert.fingerprint(hashes.SHA256()).hex().lower()
+    emb_fp = embedded.fingerprint(hashes.SHA256()).hex().lower()
+    assert file_fp == emb_fp, "embedded backup has drifted from the bundled file"
+    assert emb_fp == V.TRUST_ANCHOR_SHA256.lower(), "embedded backup must match the pin"
 
 
 def _name(cn):
@@ -255,7 +272,8 @@ if __name__ == "__main__":
     for fn in (test_genuine_chain_validates,
                test_name_spoofing_attacker_chain_rejected,
                test_tampered_pin_refuses,
-               test_malformed_anchor_refuses):
+               test_malformed_file_falls_back_to_embedded,
+               test_embedded_backup_matches_bundled_file):
         try:
             fn()
             print(f"  PASS  {fn.__name__}")

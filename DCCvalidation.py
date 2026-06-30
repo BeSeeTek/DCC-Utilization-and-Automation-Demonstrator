@@ -73,6 +73,49 @@ TRUST_ANCHOR_SHA256 = "d839672f984dca7cd480ce201627a4de61c5c1855f450e5b706200e73
 # path cryptographically terminates at the pinned root above.
 EXPECTED_INTERMEDIATE_SHA256 = "f0a1ca5fc42e6a8514c63415054f14ef7bb961adbc7a94185d8e410a905b8109"
 
+# In-source backstop for the pinned root. The bundled PEM file above is the
+# human-inspectable primary copy; this embedded copy is used only when that file
+# is missing, unreadable or malformed, so a packaging/deployment mishap can never
+# disable validation. It carries NO independent trust: like the file, it is only
+# accepted if its SHA-256 matches TRUST_ANCHOR_SHA256 (see load_trust_anchor()).
+# The two copies therefore cannot silently drift — a mismatch is rejected, not
+# trusted. Keep this byte-identical to trust_anchors/D-TRUST_Root_CA_5_2022.pem.
+TRUST_ANCHOR_PEM = """\
+-----BEGIN CERTIFICATE-----
+MIIFoDCCA4igAwIBAgIQcct6n6USPCU1re51C8CAajANBgkqhkiG9w0BAQ0FADBF
+MQswCQYDVQQGEwJERTEVMBMGA1UEChMMRC1UcnVzdCBHbWJIMR8wHQYDVQQDExZE
+LVRSVVNUIFJvb3QgQ0EgNSAyMDIyMB4XDTIyMDQwNzA4NTEyMFoXDTM3MDQwNzA4
+NTEyMFowRTELMAkGA1UEBhMCREUxFTATBgNVBAoTDEQtVHJ1c3QgR21iSDEfMB0G
+A1UEAxMWRC1UUlVTVCBSb290IENBIDUgMjAyMjCCAiIwDQYJKoZIhvcNAQEBBQAD
+ggIPADCCAgoCggIBAKe8oN4GaJP/3fyF+RoJImvtDtuKqjw5TVYz9rc3ja9H/X0F
+Lx8zibEOLzOC5RzZRLKc685is7Yexk12CjUdtm81xYt1Q+C37mcp+YkDwJGQUfjb
+m9tltt+ju+t1HV9oiv29w8zec4np2+kfrRJWWO4C7WKY3Ep/FibosLL0i6gGInBB
+xTsxXlAu2l+96UXHyz/wOujP93Xowa+GImonlGeNVeEt6F2JYv9sL775xptEnD9R
+KZsRReUePokMT3YtK1evrPIOKTOcn9foJGVVC9UbNr4oUcT47wn9JJA5jH/ZxU04
+fcP2zHlsMWtGfIA4JPGIwyMBjR5hMGoHAT34iQcAJd1aUyEd+CgeWMU/hfrt8ixL
+M+jsyHV7ZFyh0wjJ+dXxfVF1U+Tqw2xMoIvUhRBQsksvGaV03dj5sxq16iY/Wmfy
+xMbyrJwVEWOjFblc+e+zyLfb5eOiuDJsZQ18Xqstfa5oMbH9EpmaidJla93pclvm
+vH9nTQsJ1fO7NNjcZhlmjcIh34/+TgCrRrNeivoED9bQKgpzV7m0ar6rlncpDMOf
+bepMOyKbFxFXTY4HM/eFG2qRIO0IME0OHoqbar5aapJlPAA/07wJffJvkQ5Bnxir
+ehuHDFNA9hzY2xbznRoYHcqb7KZQsYDRB1JC7JLI4Gzv3mW+tHNRRwVKjnMjAgMB
+AAGjgYswgYgwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUUEk0iESbD9o0MSRc
+ZMTA9vOWpO8wDgYDVR0PAQH/BAQDAgEGMEYGA1UdHwQ/MD0wO6A5oDeGNWh0dHA6
+Ly9jcmwuZC10cnVzdC5uZXQvY3JsL2QtdHJ1c3Rfcm9vdF9jYV81XzIwMjIuY3Js
+MA0GCSqGSIb3DQEBDQUAA4ICAQCJkTedAXMj/xgsWr+ncylVHPcnRaqaw4pX8q3r
+oNVUlpf4EpCzxlik6OGFBLUFDwRviFUopsErG+mXlX/of/TtxpieOoSGyJYKzLDI
+YdyPen7QxKxGPe2IhirzM7jnNVOr2FVq8xsVG26y5RIdBAbtUwyegOCrBoov8R98
+gkgKntWbJCiCDmETM+PZqiD6BUG6euI91DOoEXPkKbaMulTaEQjTSotnwGvaQMSR
+oDoyu9mLZcjkPx00UE708RQYYzFY61SjhKuSjdzxLLY6ngQooDEg4nx+hTDI0Z/8
+F6OpUyGO26WTtuXO/r56Ih0KWbgco4tTZOFEW7BrDRS/OAoldSaBq+FggIAK9LgD
+GB4PdfdWZ68+lv8XWWpWgLNuJDzx1/U9bzL3OfKR+HTUAxm4exo2LNi3RaIql2Ex
+xTqddvFPWW8s8Sz08R6rEIomC14BtKT3PEf19YPn/JLYuV2Yl8MWnvoyTELLNYdm
+bs+8PJjV8qjTTkzDsN52izGwJ2FwTvSQw+Ke0veYBIoHo6KdvNK4TWPgs66Lh/b9
+IhmaCXzIb+HhukRSEX1mMp4mC1J20uih3O5vQ2YbuM0aGvc/+KHb1xI0j216iXpF
+PnEWI4+b5ZxJ4Klz9BSMDggaaQDEDf7qHVAXHFnBXsCIFNy4nHY/0xcDiRaMBvtK
+nd4U6Q==
+-----END CERTIFICATE-----
+"""
+
 ############################################
 #####        General Functions         #####
 ############################################
@@ -254,29 +297,45 @@ def load_trust_anchor():
 
     The trust anchor is identified CRYPTOGRAPHICALLY (by the fingerprint of the
     certificate, i.e. effectively its public key), exactly as required by RFC 5280
-    and BSI TR-02103 — never by a Common Name or Subject/Issuer DN. If the bundled
-    file is missing or does not match the pin, the function raises and the chain
-    therefore cannot be trusted: a swapped-in or attacker-supplied "root" can never
-    silently become the trust anchor.
+    and BSI TR-02103 — never by a Common Name or Subject/Issuer DN.
+
+    The certificate is sourced with a backstop:
+      1. the bundled, human-inspectable PEM file (TRUST_ANCHOR_FILE), then
+      2. the embedded in-source copy (TRUST_ANCHOR_PEM)
+    if the file is missing, unreadable or malformed. NEITHER source is trusted on
+    its own: whichever copy is loaded must match TRUST_ANCHOR_SHA256, otherwise it
+    is rejected. A swapped-in or attacker-supplied "root" can never silently become
+    the trust anchor, and a packaging mishap that loses the file cannot disable
+    validation. The only fatal case is the embedded backstop itself failing the pin
+    — that means the source code was tampered with, which is unrecoverable.
 
     :return: cryptography.x509.Certificate for the verified trust anchor
-    :raises RuntimeError: if the anchor is absent or its fingerprint does not match
+    :raises RuntimeError: if no source yields a certificate matching the pin
     """
+    def _pin_ok(cert):
+        return cert.fingerprint(hashes.SHA256()).hex().lower() == TRUST_ANCHOR_SHA256.lower()
+
+    # 1) Prefer the bundled file — but only if it matches the pin.
     try:
         with open(TRUST_ANCHOR_FILE, "rb") as fh:
-            anchor = x509.load_pem_x509_certificate(fh.read())
-    except FileNotFoundError as e:
-        raise RuntimeError(f"Pinned trust anchor file not found: {TRUST_ANCHOR_FILE}") from e
-    except (ValueError, OSError) as e:
-        # Present but unreadable/malformed PEM: funnel into the same RuntimeError
-        # path so callers get a structured validation failure, never a raw crash.
-        raise RuntimeError(
-            f"Pinned trust anchor file could not be read or parsed: {TRUST_ANCHOR_FILE} ({e})") from e
+            candidate = x509.load_pem_x509_certificate(fh.read())
+        if _pin_ok(candidate):
+            return candidate
+        validationlog.warning(
+            "Bundled trust anchor file does not match the pin; falling back to the "
+            f"embedded backup copy. file={TRUST_ANCHOR_FILE}")
+    except (FileNotFoundError, OSError, ValueError) as e:
+        validationlog.warning(
+            f"Bundled trust anchor file unavailable or malformed ({e}); falling back "
+            "to the embedded backup copy.")
 
-    actual = anchor.fingerprint(hashes.SHA256()).hex().lower()
-    if actual != TRUST_ANCHOR_SHA256.lower():
+    # 2) Embedded in-source backstop. Still pin-checked: a mismatch here means the
+    #    source code itself was tampered with, so we refuse rather than trust it.
+    anchor = x509.load_pem_x509_certificate(TRUST_ANCHOR_PEM.encode())
+    if not _pin_ok(anchor):
+        actual = anchor.fingerprint(hashes.SHA256()).hex().lower()
         raise RuntimeError(
-            "Pinned trust anchor fingerprint mismatch — refusing to trust it. "
+            "Embedded trust anchor fingerprint mismatch — refusing to trust it. "
             f"expected SHA-256 {TRUST_ANCHOR_SHA256}, got {actual}")
     return anchor
 
