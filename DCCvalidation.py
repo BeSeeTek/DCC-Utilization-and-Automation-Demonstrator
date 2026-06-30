@@ -15,7 +15,6 @@ from tkinter import messagebox
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.exceptions import InvalidSignature
 ### Own modules
 from Instance_Manager import IM
@@ -279,27 +278,25 @@ def load_trust_anchor():
 
 def _signature_is_valid(child, issuer):
     """Cryptographically verifies that `issuer` signed `child` — the actual trust
-    link of a certification path. Returns True iff the signature over
-    child.tbs_certificate_bytes verifies under issuer's public key.
+    link of a certification path. Returns True iff `issuer`'s public key verifies
+    the signature over child.tbs_certificate_bytes.
 
     This is the operation that a Common-Name string comparison can NEVER replace:
     it proves possession of the issuer's private key, which a chosen name does not.
+
+    Delegates to cryptography's `verify_directly_issued_by()`, which selects the
+    correct verification parameters for the certificate's actual signature
+    algorithm (RSA PKCS#1 v1.5, RSA-PSS, ECDSA, EdDSA) instead of us branching on
+    the key type by hand. (The genuine D-TRUST chain is RSA-PSS.) It also confirms
+    issuer.subject == child.issuer, so it raises ValueError on a name mismatch and
+    InvalidSignature on a bad signature.
     """
-    pub = issuer.public_key()
     try:
-        if isinstance(pub, ec.EllipticCurvePublicKey):
-            pub.verify(child.signature,
-                       child.tbs_certificate_bytes,
-                       child.signature_algorithm_parameters)
-        else:  # RSA (PKCS#1 v1.5 or PSS); the parameters object carries the padding
-            pub.verify(child.signature,
-                       child.tbs_certificate_bytes,
-                       child.signature_algorithm_parameters,
-                       child.signature_hash_algorithm)
+        child.verify_directly_issued_by(issuer)
         return True
     except InvalidSignature:
         return False
-    except Exception as e:
+    except (ValueError, TypeError) as e:
         validationlog.warning(f"Could not verify signature link: {e}")
         return False
 
