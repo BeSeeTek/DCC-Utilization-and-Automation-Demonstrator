@@ -267,6 +267,11 @@ def load_trust_anchor():
             anchor = x509.load_pem_x509_certificate(fh.read())
     except FileNotFoundError as e:
         raise RuntimeError(f"Pinned trust anchor file not found: {TRUST_ANCHOR_FILE}") from e
+    except (ValueError, OSError) as e:
+        # Present but unreadable/malformed PEM: funnel into the same RuntimeError
+        # path so callers get a structured validation failure, never a raw crash.
+        raise RuntimeError(
+            f"Pinned trust anchor file could not be read or parsed: {TRUST_ANCHOR_FILE} ({e})") from e
 
     actual = anchor.fingerprint(hashes.SHA256()).hex().lower()
     if actual != TRUST_ANCHOR_SHA256.lower():

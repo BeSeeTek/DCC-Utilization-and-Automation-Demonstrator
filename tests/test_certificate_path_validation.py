@@ -202,6 +202,32 @@ def test_tampered_pin_refuses():
         V.TRUST_ANCHOR_SHA256 = original
 
 
+def test_malformed_anchor_refuses(tmp_path_factory=None):
+    """INTEGRITY case: a present-but-unparseable anchor must fail gracefully.
+
+    Points the anchor path at a file containing garbage (valid path, invalid PEM)
+    and checks that load_trust_anchor() raises RuntimeError — not a raw ValueError
+    that would escape validate_certificate_chain() and crash the caller. This guards
+    the funnel that turns every anchor-load failure into a structured validation
+    reason. The original path is restored in `finally`.
+    """
+    tmp = _mk_tmp(tmp_path_factory, "malformed")
+    bad = os.path.join(tmp, "garbage.pem")
+    with open(bad, "wb") as fh:
+        fh.write(b"-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----\n")
+    original = V.TRUST_ANCHOR_FILE
+    try:
+        V.TRUST_ANCHOR_FILE = bad
+        raised = False
+        try:
+            V.load_trust_anchor()
+        except RuntimeError:
+            raised = True
+        assert raised, "load_trust_anchor must raise RuntimeError on a malformed anchor"
+    finally:
+        V.TRUST_ANCHOR_FILE = original
+
+
 def _name(cn):
     """Build a "C=DE, O=D-Trust GmbH, CN=<cn>" X.509 name (used where only a name,
     not a full certificate, is required)."""
@@ -228,7 +254,8 @@ if __name__ == "__main__":
     failures = 0
     for fn in (test_genuine_chain_validates,
                test_name_spoofing_attacker_chain_rejected,
-               test_tampered_pin_refuses):
+               test_tampered_pin_refuses,
+               test_malformed_anchor_refuses):
         try:
             fn()
             print(f"  PASS  {fn.__name__}")
