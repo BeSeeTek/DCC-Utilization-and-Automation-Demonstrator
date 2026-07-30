@@ -14,6 +14,8 @@ What is proven here:
      "D-TRUST Root CA 5 2022" / "D-TRUST CA 5-22-2 2022" is REJECTED. Such a chain
      satisfied the former string comparisons (`issuer == ca_issuer`,
      `root_subject == root_ca_file`) but must never be trusted.
+  2b. The signature-link check itself is truly cryptographic: it verifies genuine
+     RSA and ECDSA signatures and rejects a same-name / wrong-key issuer.
   3. Tampering with the pinned anchor (wrong fingerprint) makes the anchor refuse
      to load — there is no fallback to an unverified certificate.
   4. The sole in-source anchor (TRUST_ANCHOR_PEM) loads and matches the pin.
@@ -35,6 +37,13 @@ _crypto = types.ModuleType("OpenSSL.crypto")
 _ossl.crypto = _crypto
 sys.modules.setdefault("OpenSSL", _ossl)
 sys.modules.setdefault("OpenSSL.crypto", _crypto)
+# tkinter may be absent on headless CI runners; the validation code only imports
+# messagebox at module load and never calls it here, so a stub keeps CI hermetic.
+_tk = types.ModuleType("tkinter")
+_msgbox = types.ModuleType("tkinter.messagebox")
+_tk.messagebox = _msgbox
+sys.modules.setdefault("tkinter", _tk)
+sys.modules.setdefault("tkinter.messagebox", _msgbox)
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
@@ -44,7 +53,7 @@ from lxml import etree  # noqa: E402
 from cryptography import x509  # noqa: E402
 from cryptography.x509.oid import NameOID  # noqa: E402
 from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import rsa, ec  # noqa: E402
 
 # Register lightweight stand-ins for the runtime singletons before import.
 from Instance_Manager import IM  # noqa: E402
@@ -183,6 +192,53 @@ def test_name_spoofing_attacker_chain_rejected(tmp_path_factory=None):
     assert res["anchored_to_pinned_root"] is False
 
 
+def test_signature_link_verifies_across_algorithms():
+    """SIGNATURE-LINK case: _signature_is_valid() works across RSA and ECDSA.
+
+    Direct regression test for the Copilot review point about how the signature
+    link is verified. It exercises _signature_is_valid() with genuinely-issued
+    child certificates under both an RSA issuer (PKCS#1 v1.5) and an EC issuer
+    (ECDSA), and proves the check is truly cryptographic:
+
+      * a correctly-issued child verifies under its real issuer (both algorithms);
+      * a child whose issuer has the SAME name but a DIFFERENT key does NOT verify
+        (so it is the signature, not the Common Name, that decides);
+      * an unrelated issuer does not verify.
+
+    The genuine BAM chain is RSA-PSS and is additionally covered end-to-end by
+    test_genuine_chain_validates.
+    """
+    # RSA issuer -> RSA child (PKCS#1 v1.5)
+    rsa_root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    rsa_root, _ = _self_signed("Test RSA Root", rsa_root_key, rsa_root_key,
+                               _name("Test RSA Root"), True)
+    rsa_child_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    rsa_child, _ = _self_signed("Test RSA Child", rsa_child_key, rsa_root_key,
+                                rsa_root.subject, False)
+
+    # EC issuer -> EC child (ECDSA)
+    ec_root_key = ec.generate_private_key(ec.SECP256R1())
+    ec_root, _ = _self_signed("Test EC Root", ec_root_key, ec_root_key,
+                              _name("Test EC Root"), True)
+    ec_child_key = ec.generate_private_key(ec.SECP256R1())
+    ec_child, _ = _self_signed("Test EC Child", ec_child_key, ec_root_key,
+                               ec_root.subject, False)
+
+    # Correctly-issued children verify under their real issuers.
+    assert V._signature_is_valid(rsa_child, rsa_root) is True
+    assert V._signature_is_valid(ec_child, ec_root) is True
+
+    # Same issuer NAME, different KEY -> must fail on the signature, not the name.
+    imposter_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    imposter_root, _ = _self_signed("Test RSA Root", imposter_key, imposter_key,
+                                    _name("Test RSA Root"), True)
+    assert V._signature_is_valid(rsa_child, imposter_root) is False
+
+    # Unrelated issuer (also cross-algorithm) -> must fail.
+    assert V._signature_is_valid(rsa_child, ec_root) is False
+    assert V._signature_is_valid(ec_child, rsa_root) is False
+
+
 def test_tampered_pin_refuses():
     """INTEGRITY case: a mismatching pin must hard-fail, with no silent fallback.
 
@@ -260,6 +316,7 @@ if __name__ == "__main__":
     failures = 0
     for fn in (test_genuine_chain_validates,
                test_name_spoofing_attacker_chain_rejected,
+               test_signature_link_verifies_across_algorithms,
                test_tampered_pin_refuses,
                test_embedded_anchor_loads_and_matches_pin,
                test_write_trust_anchor_file_materializes_pinned_cert):
