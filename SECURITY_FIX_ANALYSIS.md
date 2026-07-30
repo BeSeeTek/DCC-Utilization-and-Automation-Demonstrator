@@ -135,20 +135,38 @@ TSPS cannot both be satisfied by a name-based reading.
 The fix replaces both patterns with a single, cryptographically grounded path
 validation against a **pinned** trust anchor. Key elements:
 
-### 3.1 The trust anchor is pinned by fingerprint and bundled in the repository
+### 3.1 The trust anchor is pinned by fingerprint and embedded in the source
 
-The genuine root is shipped as `trust_anchors/D-TRUST_Root_CA_5_2022.pem` and is
-verified on load against a hard-coded SHA-256 fingerprint:
+The genuine root is embedded directly in `DCCvalidation.py` as a single in-source
+PEM constant (`TRUST_ANCHOR_PEM`) — there is no separate `.pem` file on disk to
+lose, swap or let drift. It is verified on load against a hard-coded SHA-256
+fingerprint:
 
 ```python
-TRUST_ANCHOR_FILE   = ".../trust_anchors/D-TRUST_Root_CA_5_2022.pem"
 TRUST_ANCHOR_SHA256 = "d839672f984dca7cd480ce201627a4de61c5c1855f450e5b706200e73a23f047"
+TRUST_ANCHOR_PEM    = """-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n"""
 
 def load_trust_anchor():
-    anchor = x509.load_pem_x509_certificate(open(TRUST_ANCHOR_FILE, "rb").read())
+    anchor = x509.load_pem_x509_certificate(TRUST_ANCHOR_PEM.encode())
     if anchor.fingerprint(hashes.SHA256()).hex().lower() != TRUST_ANCHOR_SHA256.lower():
-        raise RuntimeError("Pinned trust anchor fingerprint mismatch — refusing to trust it.")
+        raise RuntimeError("Embedded trust anchor fingerprint mismatch — refusing to trust it.")
     return anchor
+```
+
+The embedded certificate carries no trust of its own: it is accepted only if its
+fingerprint equals the pin, so the sole unrecoverable failure is source-code
+tampering (certificate and pin disagreeing). Where an external tool needs the
+anchor as a real file (the `openssl ocsp -CAfile` subprocess), the pin-verified
+PEM is materialised to a temporary file via `write_trust_anchor_file()`. Anyone can
+reproduce and verify that file on Linux:
+
+```bash
+python3 - <<'PY' > D-TRUST_Root_CA_5_2022.pem
+import DCCvalidation; print(DCCvalidation.TRUST_ANCHOR_PEM, end="")
+PY
+openssl x509 -in D-TRUST_Root_CA_5_2022.pem -noout -fingerprint -sha256 \
+  | sed 's/.*=//' | tr -d ':' | tr 'A-Z' 'a-z'
+# -> d839672f984dca7cd480ce201627a4de61c5c1855f450e5b706200e73a23f047
 ```
 
 The validator **never downloads its trust anchor.** The root is no longer fetched
@@ -247,10 +265,13 @@ pitfall the specification currently invites.
 
 ## 6. Operational notes
 
-* `trust_anchors/D-TRUST_Root_CA_5_2022.pem` is part of the trusted code base and
-  should be reviewed like source. Its SHA-256 is pinned in `DCCvalidation.py`.
-* If D-Trust rotates the root, update **both** the bundled PEM and
+* The trust anchor is the embedded `TRUST_ANCHOR_PEM` constant in `DCCvalidation.py`
+  — it is part of the trusted code base and should be reviewed like source. Its
+  SHA-256 is pinned in the same file.
+* If D-Trust rotates the root, update **both** `TRUST_ANCHOR_PEM` and
   `TRUST_ANCHOR_SHA256` (and, if applicable, `EXPECTED_INTERMEDIATE_SHA256`) in the
-  same change, and record the new identifiers here.
+  same change, and record the new identifiers here. The
+  `test_embedded_anchor_loads_and_matches_pin` test fails if the certificate and the
+  pin disagree, so a half-completed rotation is caught automatically.
 * The intermediate continues to be fetched at runtime via AIA but is now only
   trusted if it cryptographically chains to the pinned root.

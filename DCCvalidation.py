@@ -7,6 +7,7 @@ from datetime import datetime as dt
 import xmlsec
 from lxml import etree
 import subprocess
+import tempfile
 import pytz
 from OpenSSL import crypto
 import re
@@ -46,9 +47,10 @@ oid = "1.3.6.1.4.1.59749.1"
 
 # --- Trust anchor: identified CRYPTOGRAPHICALLY, never by name ----------------
 # RFC 5280 / BSI TR-02103 define a trust anchor by a concrete certificate / public
-# key, not by a Common Name. We therefore bundle the genuine root certificate in
-# the repository and pin it by the SHA-256 fingerprint of its DER encoding. The
-# validator never downloads its own trust anchor and never treats a name as proof.
+# key, not by a Common Name. We therefore embed the genuine root certificate
+# directly in this source file (TRUST_ANCHOR_PEM, below) and pin it by the SHA-256
+# fingerprint of its DER encoding. The validator never downloads its own trust
+# anchor and never treats a name as proof.
 #
 # Provenance of the pinned values (cross-checked against the published certificate
 # data of D-Trust GmbH):
@@ -57,29 +59,33 @@ oid = "1.3.6.1.4.1.59749.1"
 #   SHA-1          : 64 32 11 33 21 69 B4 83 B5 5F 70 46 E5 6C BF C6 C1 1D C5 F8
 #   SHA-256 (pin)  : D8:39:67:2F:98:4D:CA:7C:D4:80:CE:20:16:27:A4:DE:
 #                    61:C5:C1:85:5F:45:0E:5B:70:62:00:E7:3A:23:F0:47
-#
-# Verify the bundled anchor independently (the printed value, with the colons
-# removed and lower-cased, must equal TRUST_ANCHOR_SHA256 below):
-#   openssl x509 -in trust_anchors/D-TRUST_Root_CA_5_2022.pem -noout -fingerprint -sha256
-# As a one-liner that yields exactly the TRUST_ANCHOR_SHA256 string:
-#   openssl x509 -in trust_anchors/D-TRUST_Root_CA_5_2022.pem -noout -fingerprint -sha256 \
-#     | sed 's/.*=//' | tr -d ':' | tr 'A-Z' 'a-z'
 # The SHA-1 / serial above can be eyeball-compared against any certificate viewer.
-TRUST_ANCHOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trust_anchors")
-TRUST_ANCHOR_FILE = os.path.join(TRUST_ANCHOR_DIR, "D-TRUST_Root_CA_5_2022.pem")
 TRUST_ANCHOR_SHA256 = "d839672f984dca7cd480ce201627a4de61c5c1855f450e5b706200e73a23f047"
 # Defense in depth: the expected issuing intermediate, also pinned by fingerprint.
 # This is an *additional* signal; the decisive trust condition remains that the
 # path cryptographically terminates at the pinned root above.
 EXPECTED_INTERMEDIATE_SHA256 = "f0a1ca5fc42e6a8514c63415054f14ef7bb961adbc7a94185d8e410a905b8109"
 
-# In-source backstop for the pinned root. The bundled PEM file above is the
-# human-inspectable primary copy; this embedded copy is used only when that file
-# is missing, unreadable or malformed, so a packaging/deployment mishap can never
-# disable validation. It carries NO independent trust: like the file, it is only
-# accepted if its SHA-256 matches TRUST_ANCHOR_SHA256 (see load_trust_anchor()).
-# The two copies therefore cannot silently drift — a mismatch is rejected, not
-# trusted. Keep this byte-identical to trust_anchors/D-TRUST_Root_CA_5_2022.pem.
+# The pinned root, embedded as the SINGLE in-source copy of the trust anchor —
+# there is deliberately no separate .pem file on disk to lose, swap or let drift.
+# It carries NO independent trust: load_trust_anchor() accepts it only if its
+# SHA-256 equals TRUST_ANCHOR_SHA256 above, otherwise it is refused.
+#
+# To materialise it as a real file on Linux (e.g. to inspect it, or to feed a tool
+# such as the OpenSSL CLI) and confirm it is the correct certificate:
+#
+#   # 1) Write the embedded certificate out to a file:
+#   python3 - <<'PY' > D-TRUST_Root_CA_5_2022.pem
+#   import DCCvalidation; print(DCCvalidation.TRUST_ANCHOR_PEM, end="")
+#   PY
+#   # (or just copy the PEM block below, BEGIN/END lines included, into that file)
+#
+#   # 2) Verify it — this MUST print exactly the pinned fingerprint
+#   #    d839672f984dca7cd480ce201627a4de61c5c1855f450e5b706200e73a23f047 :
+#   openssl x509 -in D-TRUST_Root_CA_5_2022.pem -noout -fingerprint -sha256 \
+#     | sed 's/.*=//' | tr -d ':' | tr 'A-Z' 'a-z'
+#
+# If step 2 prints anything else, the file is NOT the pinned anchor — do not trust it.
 TRUST_ANCHOR_PEM = """\
 -----BEGIN CERTIFICATE-----
 MIIFoDCCA4igAwIBAgIQcct6n6USPCU1re51C8CAajANBgkqhkiG9w0BAQ0FADBF
@@ -292,52 +298,46 @@ def check_authenticity(cert, dcc_xml, ns):
         return False
 
 def load_trust_anchor():
-    """Loads the pinned root certificate from the repository and verifies it against
-    the hard-coded SHA-256 fingerprint.
+    """Loads the pinned root certificate from the embedded TRUST_ANCHOR_PEM and
+    verifies it against the hard-coded SHA-256 fingerprint.
 
     The trust anchor is identified CRYPTOGRAPHICALLY (by the fingerprint of the
     certificate, i.e. effectively its public key), exactly as required by RFC 5280
     and BSI TR-02103 — never by a Common Name or Subject/Issuer DN.
 
-    The certificate is sourced with a backstop:
-      1. the bundled, human-inspectable PEM file (TRUST_ANCHOR_FILE), then
-      2. the embedded in-source copy (TRUST_ANCHOR_PEM)
-    if the file is missing, unreadable or malformed. NEITHER source is trusted on
-    its own: whichever copy is loaded must match TRUST_ANCHOR_SHA256, otherwise it
-    is rejected. A swapped-in or attacker-supplied "root" can never silently become
-    the trust anchor, and a packaging mishap that loses the file cannot disable
-    validation. The only fatal case is the embedded backstop itself failing the pin
-    — that means the source code was tampered with, which is unrecoverable.
+    The certificate lives in exactly one place: the in-source TRUST_ANCHOR_PEM
+    string. It is not trusted on its own — it is accepted only if its SHA-256 equals
+    TRUST_ANCHOR_SHA256, otherwise this function raises and nothing is trusted. The
+    only way to fail here is for the embedded certificate and the pin to disagree,
+    which means the source code was tampered with — an unrecoverable condition, so
+    refusing is the correct response.
 
     :return: cryptography.x509.Certificate for the verified trust anchor
-    :raises RuntimeError: if no source yields a certificate matching the pin
+    :raises RuntimeError: if the embedded certificate does not match the pin
     """
-    def _pin_ok(cert):
-        return cert.fingerprint(hashes.SHA256()).hex().lower() == TRUST_ANCHOR_SHA256.lower()
-
-    # 1) Prefer the bundled file — but only if it matches the pin.
-    try:
-        with open(TRUST_ANCHOR_FILE, "rb") as fh:
-            candidate = x509.load_pem_x509_certificate(fh.read())
-        if _pin_ok(candidate):
-            return candidate
-        validationlog.warning(
-            "Bundled trust anchor file does not match the pin; falling back to the "
-            f"embedded backup copy. file={TRUST_ANCHOR_FILE}")
-    except (FileNotFoundError, OSError, ValueError) as e:
-        validationlog.warning(
-            f"Bundled trust anchor file unavailable or malformed ({e}); falling back "
-            "to the embedded backup copy.")
-
-    # 2) Embedded in-source backstop. Still pin-checked: a mismatch here means the
-    #    source code itself was tampered with, so we refuse rather than trust it.
     anchor = x509.load_pem_x509_certificate(TRUST_ANCHOR_PEM.encode())
-    if not _pin_ok(anchor):
-        actual = anchor.fingerprint(hashes.SHA256()).hex().lower()
+    actual = anchor.fingerprint(hashes.SHA256()).hex().lower()
+    if actual != TRUST_ANCHOR_SHA256.lower():
         raise RuntimeError(
             "Embedded trust anchor fingerprint mismatch — refusing to trust it. "
             f"expected SHA-256 {TRUST_ANCHOR_SHA256}, got {actual}")
     return anchor
+
+
+def write_trust_anchor_file(path):
+    """Materialise the pinned, in-source trust anchor (TRUST_ANCHOR_PEM) to `path`
+    and return it. The certificate is pin-verified via load_trust_anchor() BEFORE it
+    is written, so the file always holds the genuine root. Used where an external
+    tool needs a real file on disk — e.g. the `openssl ocsp -CAfile` subprocess.
+
+    :param path: destination path for the PEM file
+    :return: `path`
+    :raises RuntimeError: if the embedded certificate does not match the pin
+    """
+    load_trust_anchor()  # pin check first; never write an unverified certificate
+    with open(path, "w") as fh:
+        fh.write(TRUST_ANCHOR_PEM)
+    return path
 
 
 def _signature_is_valid(child, issuer):
@@ -785,7 +785,11 @@ def performDCCvalidation(filepath, mode, id=None):
             #TODO Gültigkeitszeitraum vom D Trust Zertifikat überprüfen
             
             # Revocation status via OCSP, anchored to the PINNED root (not a download). (Schritt 3 der TSPS)
-            cert_is_valid = verify_certificate("seal_cert.pem", "D-TRUST CA 5-22-2 2022.pem", oscp_url, TRUST_ANCHOR_FILE, signing_date)
+            # The OpenSSL CLI needs a -CAfile on disk, so materialise the embedded,
+            # pin-verified anchor to a temporary file for this call.
+            trust_anchor_path = write_trust_anchor_file(
+                os.path.join(tempfile.gettempdir(), "D-TRUST_Root_CA_5_2022.pem"))
+            cert_is_valid = verify_certificate("seal_cert.pem", "D-TRUST CA 5-22-2 2022.pem", oscp_url, trust_anchor_path, signing_date)
 
             # Schritt 4 der TSPS — issuer / trust-anchor confirmation.
             #
