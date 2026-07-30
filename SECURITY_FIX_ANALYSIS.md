@@ -155,10 +155,9 @@ def load_trust_anchor():
 
 The embedded certificate carries no trust of its own: it is accepted only if its
 fingerprint equals the pin, so the sole unrecoverable failure is source-code
-tampering (certificate and pin disagreeing). Where an external tool needs the
-anchor as a real file (the `openssl ocsp -CAfile` subprocess), the pin-verified
-PEM is materialised to a temporary file via `write_trust_anchor_file()`. Anyone can
-reproduce and verify that file on Linux:
+tampering (certificate and pin disagreeing). The anchor is never written to disk —
+revocation checking is done in-process (see §3.3), so no external tool needs it as
+a file. Anyone can nonetheless reproduce and verify it on Linux:
 
 ```bash
 python3 - <<'PY' > D-TRUST_Root_CA_5_2022.pem
@@ -203,14 +202,36 @@ root` using cryptographic and temporal properties only:
 * **Defense in depth** — the issuing intermediate is additionally compared to an
   expected pinned fingerprint (`intermediate_pin_ok`).
 
-### 3.3 Mapping of the old decision variables
+### 3.3 Revocation checking done in-process (no CLI, no file)
+
+The OCSP revocation check (`verify_certificate`) is performed entirely in-process
+with `cryptography`: the request is built in memory, POSTed to the responder, and
+the response is verified in code — the OpenSSL CLI is no longer invoked and nothing
+is written to disk. Verification is **fail-closed** (`_ocsp_response_is_good`):
+`True` is returned only when
+
+* the responder returns `SUCCESSFUL`,
+* the response concerns exactly the queried certificate (serial match),
+* the response signature is trusted — signed by the issuer directly, or by a
+  responder certificate that the issuer delegated (issued by the issuer and bearing
+  the `id-kp-OCSPSigning` EKU, per RFC 6960),
+* the signing time lies within `thisUpdate..nextUpdate`, and
+* the certificate status is explicitly `GOOD`.
+
+Revoked, unknown, stale, wrong-certificate, untrusted-signer, and network/parse
+failures all return `False`. Because the response is verified against the
+already-path-validated issuer, the pinned root never has to be materialised as a
+file (this also resolves the shared-temp-file / TOCTOU concern of an earlier
+iteration that wrote the anchor to `/tmp`).
+
+### 3.4 Mapping of the old decision variables
 
 | Old (name-based) | New (cryptographic) |
 |---|---|
 | `verify_certificate_signature(..., downloaded_root, ...)` | `validate_certificate_chain(...)["chain_ok"]` — full path to the **pinned** anchor |
 | `if issuer == ca_issuer` (CN string) | `intermediate_pin_ok` — issuing CA matches the expected pinned fingerprint |
 | `find_root_cert()` + `if root_subject == root_ca_file` (CN string) | `anchored_to_pinned_root` — path provably ends at the SHA-256-pinned root |
-| OCSP `-CAfile <downloaded root>` | OCSP `-CAfile <pinned trust anchor>` |
+| OCSP via `openssl ocsp -CAfile <downloaded root>` | in-process OCSP, response verified against the path-validated issuer (`_ocsp_response_is_good`) |
 
 The CN walk (`find_root_cert`) has been removed; the string constants `ca_issuer`
 and `root_ca_file` are retained **only** as human-readable log labels and are

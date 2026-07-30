@@ -7,15 +7,18 @@ from datetime import datetime as dt
 import xmlsec
 from lxml import etree
 import subprocess
-import tempfile
 import pytz
 from OpenSSL import crypto
 import re
 import locale
 from tkinter import messagebox
 from cryptography import x509
+from cryptography.x509 import ocsp
+from cryptography.x509.oid import ExtendedKeyUsageOID
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding
+from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.exceptions import InvalidSignature
 ### Own modules
 from Instance_Manager import IM
@@ -324,22 +327,6 @@ def load_trust_anchor():
     return anchor
 
 
-def write_trust_anchor_file(path):
-    """Materialise the pinned, in-source trust anchor (TRUST_ANCHOR_PEM) to `path`
-    and return it. The certificate is pin-verified via load_trust_anchor() BEFORE it
-    is written, so the file always holds the genuine root. Used where an external
-    tool needs a real file on disk — e.g. the `openssl ocsp -CAfile` subprocess.
-
-    :param path: destination path for the PEM file
-    :return: `path`
-    :raises RuntimeError: if the embedded certificate does not match the pin
-    """
-    load_trust_anchor()  # pin check first; never write an unverified certificate
-    with open(path, "w") as fh:
-        fh.write(TRUST_ANCHOR_PEM)
-    return path
-
-
 def _signature_is_valid(child, issuer):
     """Cryptographically verifies that `issuer` signed `child` — the actual trust
     link of a certification path. Returns True iff `issuer`'s public key verifies
@@ -528,51 +515,137 @@ def extract_ocsp_info(cert_file):
         return None, None
 
 
-def verify_certificate(cert_file, issuer_cert, ocsp_url, root_ca, signing_date):
-    """
-    Verifies the validity of a certificate using OCSP (Online Certificate Status Protocol) via OpenSSL.
-    Args:
-        cert_file (str): Path to the certificate file to be verified.
-        issuer_cert (str): Path to the issuer's certificate file.
-        ocsp_url (str): URL of the OCSP responder.
-        root_ca (str): Path to the root CA certificate file.
-        signing_date (str): The signing date in ISO 8601 format (e.g., 'YYYY-MM-DDTHH:MM:SSZ').
-    Returns:
-        bool: True if the certificate is valid ("good" status), False otherwise (revoked, unknown, or error).
-    Logs:
-        - Logs the result of the OCSP check (valid, revoked, unknown, or error) using the validationlog logger.
-    Raises:
-        None. All exceptions are handled internally and result in a False return value.
-    """
-    datetime = dt.strptime(signing_date, '%Y-%m-%dT%H:%M:%SZ')
-    unixtime = int(datetime.timestamp())
-    cmd = [
-        "openssl", "ocsp", "-attime", f"{unixtime}",
-        "-issuer", issuer_cert,
-        "-cert", cert_file,
-        "-url", ocsp_url,
-        "-CAfile", root_ca,
-        "-text"
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        output = result.stdout
-        if "Cert Status: good" in output:
-            validationlog.info("✅ Certificate is valid")
-            return True
-        elif "Cert Status: revoked" in output:
-            validationlog.warning("❌ Certificate is revoked")
-            return False
-        elif "Cert Status: unknown" in output:
-            validationlog.warning("❓ Certificatestatus is unknown")
-            return False
-        else:
-            validationlog.warning("⚠️ No clear answer received from OCSP responder")
-            return False
+def _ocsp_response_signed_by(response, signer_cert):
+    """True iff `signer_cert`'s public key verifies the OCSP response signature.
 
-    except subprocess.CalledProcessError as e:
-        validationlog.error(f"Error during OCSP verification: {e.stderr}")
+    Verifies the response signature over `tbs_response_bytes`. OCSP responses have
+    no `verify_directly_issued_by()` equivalent, so RSA/ECDSA are handled explicitly;
+    any other key type or a bad signature yields False (fail-closed).
+    """
+    pub = signer_cert.public_key()
+    try:
+        if isinstance(pub, ec.EllipticCurvePublicKey):
+            pub.verify(response.signature, response.tbs_response_bytes,
+                       ec.ECDSA(response.signature_hash_algorithm))
+        elif isinstance(pub, rsa.RSAPublicKey):
+            pub.verify(response.signature, response.tbs_response_bytes,
+                       padding.PKCS1v15(), response.signature_hash_algorithm)
+        else:
+            return False
+        return True
+    except InvalidSignature:
         return False
+    except Exception as e:
+        validationlog.warning(f"OCSP: could not verify response signature: {e}")
+        return False
+
+
+def _ocsp_signature_trusted(response, issuer):
+    """True iff the OCSP response is signed by a party authorised by `issuer` (RFC 6960):
+    either the issuer CA directly, or a delegated responder certificate that is
+    (a) directly issued by `issuer` and (b) carries the id-kp-OCSPSigning EKU.
+    """
+    # Case A: signed directly by the issuing CA.
+    if _ocsp_response_signed_by(response, issuer):
+        return True
+    # Case B: a delegated responder certificate carried inside the response.
+    for responder in (response.certificates or []):
+        try:
+            responder.verify_directly_issued_by(issuer)  # issuer must have signed it
+            ekus = responder.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+            if ExtendedKeyUsageOID.OCSP_SIGNING not in ekus:
+                continue
+        except Exception:
+            continue
+        if _ocsp_response_signed_by(response, responder):
+            return True
+    return False
+
+
+def _ocsp_response_is_good(response, cert, issuer, at):
+    """Fail-closed evaluation of a parsed OCSP response. Returns True ONLY if:
+      * the responder returned SUCCESSFUL,
+      * the response concerns exactly `cert` (serial match),
+      * its signature is trusted (issuer or an issuer-delegated responder),
+      * `at` (the signing time) lies within thisUpdate..nextUpdate, and
+      * the certificate status is explicitly GOOD.
+    Anything else — revoked, unknown, expired, wrong signer, parse gap — is False.
+    """
+    if response.response_status != ocsp.OCSPResponseStatus.SUCCESSFUL:
+        validationlog.warning(f"OCSP: responder returned {response.response_status.name}")
+        return False
+    if response.serial_number != cert.serial_number:
+        validationlog.warning("OCSP: response serial does not match the queried certificate")
+        return False
+    if not _ocsp_signature_trusted(response, issuer):
+        validationlog.warning("OCSP: response signature is not trusted")
+        return False
+
+    this_update = getattr(response, "this_update_utc", None)
+    if this_update is None:
+        this_update = pytz.utc.localize(response.this_update)
+    next_update = getattr(response, "next_update_utc", None)
+    if next_update is None and response.next_update is not None:
+        next_update = pytz.utc.localize(response.next_update)
+    if at < this_update or (next_update is not None and at > next_update):
+        validationlog.warning("OCSP: response is not time-valid at the signing date")
+        return False
+
+    if response.certificate_status == ocsp.OCSPCertStatus.GOOD:
+        validationlog.info("✅ Certificate is valid (OCSP status: good)")
+        return True
+    if response.certificate_status == ocsp.OCSPCertStatus.REVOKED:
+        validationlog.warning("❌ Certificate is revoked (OCSP)")
+        return False
+    validationlog.warning("❓ OCSP certificate status is unknown")
+    return False
+
+
+def verify_certificate(cert_file, issuer_cert, ocsp_url, signing_date):
+    """Checks a certificate's revocation status via OCSP, fully in-process.
+
+    Builds the OCSP request in memory with `cryptography`, POSTs it to the responder,
+    and verifies the response itself — no OpenSSL CLI and no trust-anchor file written
+    to disk. The response is verified against the (already path-validated) issuer, so
+    the pinned root does not need to be materialised anywhere.
+
+    Fail-closed: returns True only when the responder explicitly reports GOOD, its
+    signature is trusted and the response is time-valid; every other outcome
+    (revoked, unknown, network/parse error, untrusted signer) returns False.
+
+    :param cert_file: path to the end-entity (seal) certificate, PEM
+    :param issuer_cert: path to the issuing intermediate certificate, PEM
+    :param ocsp_url: URL of the OCSP responder
+    :param signing_date: validation time, ISO 'YYYY-MM-DDTHH:MM:SSZ' or datetime
+    :return: bool
+    """
+    at = signing_date if isinstance(signing_date, dt) else dt.strptime(signing_date, '%Y-%m-%dT%H:%M:%SZ')
+    if at.tzinfo is None:
+        at = pytz.utc.localize(at)
+    try:
+        with open(cert_file, "rb") as fh:
+            cert = x509.load_pem_x509_certificate(fh.read())
+        with open(issuer_cert, "rb") as fh:
+            issuer = x509.load_pem_x509_certificate(fh.read())
+    except (OSError, ValueError) as e:
+        validationlog.error(f"OCSP: could not load certificates: {e}")
+        return False
+
+    try:
+        request = ocsp.OCSPRequestBuilder().add_certificate(cert, issuer, hashes.SHA1()).build()
+        http = requests.post(
+            ocsp_url,
+            data=request.public_bytes(Encoding.DER),
+            headers={"Content-Type": "application/ocsp-request",
+                     "Accept": "application/ocsp-response"},
+            timeout=15)
+        http.raise_for_status()
+        response = ocsp.load_der_ocsp_response(http.content)
+    except Exception as e:
+        validationlog.error(f"OCSP: request/response failed: {e}")
+        return False
+
+    return _ocsp_response_is_good(response, cert, issuer, at)
 
 
 # NOTE: the former `find_root_cert()` helper walked the chain by comparing the
@@ -784,12 +857,11 @@ def performDCCvalidation(filepath, mode, id=None):
             validationlog.info(f"signing_date liegt im Gültigkeitsbereich des Siegelzertifikats: {signing_date_is_ok}")
             #TODO Gültigkeitszeitraum vom D Trust Zertifikat überprüfen
             
-            # Revocation status via OCSP, anchored to the PINNED root (not a download). (Schritt 3 der TSPS)
-            # The OpenSSL CLI needs a -CAfile on disk, so materialise the embedded,
-            # pin-verified anchor to a temporary file for this call.
-            trust_anchor_path = write_trust_anchor_file(
-                os.path.join(tempfile.gettempdir(), "D-TRUST_Root_CA_5_2022.pem"))
-            cert_is_valid = verify_certificate("seal_cert.pem", "D-TRUST CA 5-22-2 2022.pem", oscp_url, trust_anchor_path, signing_date)
+            # Revocation status via OCSP, performed fully in-process (cryptography):
+            # the request is built and the response verified in memory against the
+            # already path-validated issuer, so nothing is written to disk and no
+            # OpenSSL CLI / trust-anchor file is involved. (Schritt 3 der TSPS)
+            cert_is_valid = verify_certificate("seal_cert.pem", "D-TRUST CA 5-22-2 2022.pem", oscp_url, signing_date)
 
             # Schritt 4 der TSPS — issuer / trust-anchor confirmation.
             #
