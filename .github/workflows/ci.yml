@@ -34,3 +34,31 @@ jobs:
 
       - name: Run certificate path-validation tests
         run: python tests/test_certificate_path_validation.py
+
+  xml-signature-integrity:
+    name: XMLDSig seal integrity tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # This suite verifies REAL XML digital signatures with xmlsec against the
+      # sealed sample DCCs, so xmlsec must not be stubbed. The PyPI xmlsec wheels
+      # bundle libxmlsec1, so no system packages are required.
+      - name: Install the runtime dependencies the tests need
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install xmlsec lxml cryptography pytz
+
+      - name: Run XMLDSig seal integrity tests
+        run: python tests/test_xml_signature_integrity.py
