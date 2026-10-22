@@ -14,11 +14,14 @@ What is proven here:
      "D-TRUST Root CA 5 2022" / "D-TRUST CA 5-22-2 2022" is REJECTED. Such a chain
      satisfied the former string comparisons (`issuer == ca_issuer`,
      `root_subject == root_ca_file`) but must never be trusted.
+  2b. The signature-link check itself is truly cryptographic: it verifies genuine
+     RSA and ECDSA signatures and rejects a same-name / wrong-key issuer.
   3. Tampering with the pinned anchor (wrong fingerprint) makes the anchor refuse
      to load — there is no fallback to an unverified certificate.
   4. The sole in-source anchor (TRUST_ANCHOR_PEM) loads and matches the pin.
-  5. Materialising the embedded anchor to a file (the documented Linux recipe)
-     yields a certificate whose fingerprint equals the pin.
+  5. The in-process OCSP evaluation is fail-closed: only a GOOD, in-window response
+     signed by the issuer (or an issuer-delegated responder) is accepted; revoked,
+     untrusted-signer, stale and wrong-certificate responses are all rejected.
 """
 import os
 import sys
@@ -35,6 +38,13 @@ _crypto = types.ModuleType("OpenSSL.crypto")
 _ossl.crypto = _crypto
 sys.modules.setdefault("OpenSSL", _ossl)
 sys.modules.setdefault("OpenSSL.crypto", _crypto)
+# tkinter may be absent on headless CI runners; the validation code only imports
+# messagebox at module load and never calls it here, so a stub keeps CI hermetic.
+_tk = types.ModuleType("tkinter")
+_msgbox = types.ModuleType("tkinter.messagebox")
+_tk.messagebox = _msgbox
+sys.modules.setdefault("tkinter", _tk)
+sys.modules.setdefault("tkinter.messagebox", _msgbox)
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
@@ -42,9 +52,10 @@ sys.path.insert(0, REPO_ROOT)
 
 from lxml import etree  # noqa: E402
 from cryptography import x509  # noqa: E402
-from cryptography.x509.oid import NameOID  # noqa: E402
+from cryptography.x509 import ocsp  # noqa: E402
+from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID  # noqa: E402
 from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import rsa, ec  # noqa: E402
 
 # Register lightweight stand-ins for the runtime singletons before import.
 from Instance_Manager import IM  # noqa: E402
@@ -183,6 +194,53 @@ def test_name_spoofing_attacker_chain_rejected(tmp_path_factory=None):
     assert res["anchored_to_pinned_root"] is False
 
 
+def test_signature_link_verifies_across_algorithms():
+    """SIGNATURE-LINK case: _signature_is_valid() works across RSA and ECDSA.
+
+    Direct regression test for the Copilot review point about how the signature
+    link is verified. It exercises _signature_is_valid() with genuinely-issued
+    child certificates under both an RSA issuer (PKCS#1 v1.5) and an EC issuer
+    (ECDSA), and proves the check is truly cryptographic:
+
+      * a correctly-issued child verifies under its real issuer (both algorithms);
+      * a child whose issuer has the SAME name but a DIFFERENT key does NOT verify
+        (so it is the signature, not the Common Name, that decides);
+      * an unrelated issuer does not verify.
+
+    The genuine BAM chain is RSA-PSS and is additionally covered end-to-end by
+    test_genuine_chain_validates.
+    """
+    # RSA issuer -> RSA child (PKCS#1 v1.5)
+    rsa_root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    rsa_root, _ = _self_signed("Test RSA Root", rsa_root_key, rsa_root_key,
+                               _name("Test RSA Root"), True)
+    rsa_child_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    rsa_child, _ = _self_signed("Test RSA Child", rsa_child_key, rsa_root_key,
+                                rsa_root.subject, False)
+
+    # EC issuer -> EC child (ECDSA)
+    ec_root_key = ec.generate_private_key(ec.SECP256R1())
+    ec_root, _ = _self_signed("Test EC Root", ec_root_key, ec_root_key,
+                              _name("Test EC Root"), True)
+    ec_child_key = ec.generate_private_key(ec.SECP256R1())
+    ec_child, _ = _self_signed("Test EC Child", ec_child_key, ec_root_key,
+                               ec_root.subject, False)
+
+    # Correctly-issued children verify under their real issuers.
+    assert V._signature_is_valid(rsa_child, rsa_root) is True
+    assert V._signature_is_valid(ec_child, ec_root) is True
+
+    # Same issuer NAME, different KEY -> must fail on the signature, not the name.
+    imposter_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    imposter_root, _ = _self_signed("Test RSA Root", imposter_key, imposter_key,
+                                    _name("Test RSA Root"), True)
+    assert V._signature_is_valid(rsa_child, imposter_root) is False
+
+    # Unrelated issuer (also cross-algorithm) -> must fail.
+    assert V._signature_is_valid(rsa_child, ec_root) is False
+    assert V._signature_is_valid(ec_child, rsa_root) is False
+
+
 def test_tampered_pin_refuses():
     """INTEGRITY case: a mismatching pin must hard-fail, with no silent fallback.
 
@@ -217,22 +275,192 @@ def test_embedded_anchor_loads_and_matches_pin():
     assert fp == V.TRUST_ANCHOR_SHA256.lower(), "embedded anchor must match the pin"
 
 
-def test_write_trust_anchor_file_materializes_pinned_cert(tmp_path_factory=None):
-    """MATERIALISATION case: casting the embedded anchor to a file yields the pin.
+# --- OCSP (in-process revocation check) -------------------------------------
+# These exercise the fail-closed OCSP response evaluation V._ocsp_response_is_good()
+# with synthetic, signed OCSP responses (no network). They pin down the security
+# contract: only an explicitly GOOD, in-window response signed by the issuer (or an
+# issuer-delegated responder) is accepted; everything else is rejected.
 
-    Mirrors the documented Linux recipe (write TRUST_ANCHOR_PEM to a file, then
-    check its fingerprint). write_trust_anchor_file() must produce a parseable PEM
-    whose SHA-256 equals the pin — the same value the openssl one-liner in the source
-    comment prints. Guards the file the OCSP subprocess consumes.
+_OCSP_AT = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+_OCSP_THIS = datetime.datetime(2024, 5, 31, tzinfo=datetime.timezone.utc)
+_OCSP_NEXT = datetime.datetime(2024, 6, 2, tzinfo=datetime.timezone.utc)
+# Time of the (simulated) OCSP query — inside thisUpdate..nextUpdate.
+_OCSP_NOW = datetime.datetime(2024, 6, 1, 12, tzinfo=datetime.timezone.utc)
+
+
+def _issuer_and_child():
+    """Build a self-signed issuer CA (RSA) and a child certificate it issues."""
+    issuer_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    issuer, _ = _self_signed("OCSP Test Issuer", issuer_key, issuer_key,
+                             _name("OCSP Test Issuer"), True)
+    child_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    child, _ = _self_signed("OCSP Test Leaf", child_key, issuer_key, issuer.subject, False)
+    return issuer, issuer_key, child
+
+
+def _ocsp_response(child, issuer, signer_cert, signer_key, status,
+                   this_update=_OCSP_THIS, next_update=_OCSP_NEXT,
+                   revocation_time=None, embed_certs=None):
+    """Build and re-parse a signed OCSP response (as the responder would return)."""
+    builder = ocsp.OCSPResponseBuilder().add_response(
+        cert=child, issuer=issuer, algorithm=hashes.SHA1(),
+        cert_status=status, this_update=this_update, next_update=next_update,
+        revocation_time=revocation_time, revocation_reason=None)
+    builder = builder.responder_id(ocsp.OCSPResponderEncoding.NAME, signer_cert)
+    if embed_certs:
+        builder = builder.certificates(embed_certs)
+    signed = builder.sign(signer_key, hashes.SHA256())
+    return ocsp.load_der_ocsp_response(signed.public_bytes(serialization.Encoding.DER))
+
+
+def test_ocsp_good_response_accepted():
+    """OCSP: a GOOD, in-window, issuer-signed response is accepted."""
+    issuer, issuer_key, child = _issuer_and_child()
+    resp = _ocsp_response(child, issuer, issuer, issuer_key, ocsp.OCSPCertStatus.GOOD)
+    assert V._ocsp_response_is_good(resp, child, issuer, _OCSP_AT, now=_OCSP_NOW) is True
+
+
+def test_ocsp_revoked_response_rejected():
+    """OCSP: a REVOKED response must never be accepted."""
+    issuer, issuer_key, child = _issuer_and_child()
+    resp = _ocsp_response(child, issuer, issuer, issuer_key, ocsp.OCSPCertStatus.REVOKED,
+                          revocation_time=datetime.datetime(2024, 5, 15,
+                                                            tzinfo=datetime.timezone.utc))
+    assert V._ocsp_response_is_good(resp, child, issuer, _OCSP_AT, now=_OCSP_NOW) is False
+
+
+def test_ocsp_untrusted_signer_rejected():
+    """OCSP: a response signed by a party the issuer did not authorise is rejected.
+
+    The response says GOOD, but it is signed by an unrelated CA that the issuer never
+    delegated (no responder certificate is included that chains to the issuer). It
+    must not be trusted — otherwise anyone could forge a 'good' status.
     """
-    tmp = _mk_tmp(tmp_path_factory, "materialize")
-    out = os.path.join(tmp, "D-TRUST_Root_CA_5_2022.pem")
-    returned = V.write_trust_anchor_file(out)
-    assert returned == out
-    written = x509.load_pem_x509_certificate(open(out, "rb").read())
-    fp = written.fingerprint(hashes.SHA256()).hex().lower()
-    assert fp == V.TRUST_ANCHOR_SHA256.lower(), "materialised file must match the pin"
+    issuer, issuer_key, child = _issuer_and_child()
+    rogue_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    rogue, _ = _self_signed("Rogue Responder", rogue_key, rogue_key,
+                            _name("Rogue Responder"), True)
+    resp = _ocsp_response(child, issuer, rogue, rogue_key, ocsp.OCSPCertStatus.GOOD)
+    assert V._ocsp_response_is_good(resp, child, issuer, _OCSP_AT, now=_OCSP_NOW) is False
 
+
+def test_ocsp_delegated_responder_accepted():
+    """OCSP: a GOOD response from an issuer-delegated responder is accepted (RFC 6960).
+
+    The responder certificate is issued by the CA and carries the id-kp-OCSPSigning
+    EKU, and is embedded in the response. This guards against over-rejecting the
+    legitimate delegated-responder case that real OCSP deployments use.
+    """
+    issuer, issuer_key, child = _issuer_and_child()
+    resp_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    nb = datetime.datetime(2023, 1, 1, tzinfo=datetime.timezone.utc)
+    na = datetime.datetime(2035, 1, 1, tzinfo=datetime.timezone.utc)
+    responder = (x509.CertificateBuilder()
+                 .subject_name(_name("Delegated OCSP Responder"))
+                 .issuer_name(issuer.subject)
+                 .public_key(resp_key.public_key())
+                 .serial_number(x509.random_serial_number())
+                 .not_valid_before(nb).not_valid_after(na)
+                 .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+                 .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.OCSP_SIGNING]), False)
+                 .sign(issuer_key, hashes.SHA256()))
+    resp = _ocsp_response(child, issuer, responder, resp_key, ocsp.OCSPCertStatus.GOOD,
+                          embed_certs=[responder])
+    assert V._ocsp_response_is_good(resp, child, issuer, _OCSP_AT, now=_OCSP_NOW) is True
+
+
+def test_ocsp_stale_response_rejected():
+    """OCSP: a response that is no longer fresh at query time (now > nextUpdate) is rejected."""
+    issuer, issuer_key, child = _issuer_and_child()
+    resp = _ocsp_response(child, issuer, issuer, issuer_key, ocsp.OCSPCertStatus.GOOD)
+    too_late = datetime.datetime(2024, 6, 10, tzinfo=datetime.timezone.utc)  # after next_update
+    assert V._ocsp_response_is_good(resp, child, issuer, _OCSP_AT, now=too_late) is False
+
+
+def test_ocsp_future_response_rejected():
+    """OCSP: a response whose thisUpdate lies beyond the clock-skew tolerance in the
+    future (relative to query time) is rejected."""
+    issuer, issuer_key, child = _issuer_and_child()
+    resp = _ocsp_response(child, issuer, issuer, issuer_key, ocsp.OCSPCertStatus.GOOD)
+    too_early = _OCSP_THIS - datetime.timedelta(hours=1)
+    assert V._ocsp_response_is_good(resp, child, issuer, _OCSP_AT, now=too_early) is False
+
+
+def test_ocsp_fresh_response_for_past_signing_date_accepted():
+    """OCSP: the real-world case — a DCC sealed long ago, checked today.
+
+    A live responder answers with thisUpdate ~ now, so the signing time lies well
+    before thisUpdate. Freshness is judged against the query time, so a current
+    GOOD response must be accepted (regression test: checking the signing time
+    against thisUpdate rejected every real DCC).
+    """
+    issuer, issuer_key, child = _issuer_and_child()
+    resp = _ocsp_response(child, issuer, issuer, issuer_key, ocsp.OCSPCertStatus.GOOD)
+    sealed = datetime.datetime(2023, 3, 1, tzinfo=datetime.timezone.utc)  # before thisUpdate
+    assert V._ocsp_response_is_good(resp, child, issuer, sealed, now=_OCSP_NOW) is True
+
+
+def test_ocsp_revoked_after_signing_still_rejected():
+    """OCSP: REVOKED is rejected even if revocation happened after the signing time,
+    because the signing time is self-asserted by the signer (no trusted timestamp)."""
+    issuer, issuer_key, child = _issuer_and_child()
+    resp = _ocsp_response(child, issuer, issuer, issuer_key, ocsp.OCSPCertStatus.REVOKED,
+                          revocation_time=datetime.datetime(2024, 5, 30,
+                                                            tzinfo=datetime.timezone.utc))
+    sealed = datetime.datetime(2023, 3, 1, tzinfo=datetime.timezone.utc)
+    assert V._ocsp_response_is_good(resp, child, issuer, sealed, now=_OCSP_NOW) is False
+
+
+def test_ocsp_serial_mismatch_rejected():
+    """OCSP: a response about a DIFFERENT certificate is rejected."""
+    issuer, issuer_key, child = _issuer_and_child()
+    other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    other, _ = _self_signed("OCSP Other Leaf", other_key, issuer_key, issuer.subject, False)
+    resp = _ocsp_response(child, issuer, issuer, issuer_key, ocsp.OCSPCertStatus.GOOD)
+    # Response is about `child`, but we evaluate it as the status of `other`.
+    assert V._ocsp_response_is_good(resp, other, issuer, _OCSP_AT, now=_OCSP_NOW) is False
+
+
+
+def test_intermediate_ocsp_checked_against_pinned_root():
+    """OCSP (intermediate): the genuine intermediate's status is queried with the
+    PINNED root as issuer and the responder URL from the intermediate's own AIA.
+
+    _query_ocsp is replaced by a recorder (no network), so this pins down the
+    wiring: the response will be judged against the pinned anchor, never against
+    a root fetched from the network.
+    """
+    calls = []
+    original = V._query_ocsp
+    V._query_ocsp = lambda cert, issuer, url, at: calls.append((cert, issuer, url, at)) or True
+    try:
+        assert V.verify_intermediate_revocation(INTERMEDIATE, "2024-03-01T10:00:00Z") is True
+    finally:
+        V._query_ocsp = original
+    assert len(calls) == 1
+    cert, issuer, url, at = calls[0]
+    assert issuer.fingerprint(hashes.SHA256()).hex() == V.TRUST_ANCHOR_SHA256
+    assert cert.fingerprint(hashes.SHA256()).hex() == V.EXPECTED_INTERMEDIATE_SHA256
+    assert url == "http://dtr-root-ca-5-2022.ocsp.d-trust.net"
+    assert at == datetime.datetime(2024, 3, 1, 10, tzinfo=datetime.timezone.utc)
+
+
+def test_intermediate_without_ocsp_url_rejected(tmp_path_factory=None):
+    """OCSP (intermediate): an intermediate without an OCSP URL fails closed —
+    no query is made and the status is not treated as good."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    cert, _ = _self_signed("No AIA Intermediate", key, key, _name("No AIA Intermediate"), True)
+    path = os.path.join(_mk_tmp(tmp_path_factory, "noaia"), "intermediate.pem")
+    with open(path, "wb") as fh:
+        fh.write(cert.public_bytes(serialization.Encoding.PEM))
+    calls = []
+    original = V._query_ocsp
+    V._query_ocsp = lambda *a: calls.append(a) or True
+    try:
+        assert V.verify_intermediate_revocation(path, "2024-03-01T10:00:00Z") is False
+    finally:
+        V._query_ocsp = original
+    assert calls == []
 
 def _name(cn):
     """Build a "C=DE, O=D-Trust GmbH, CN=<cn>" X.509 name (used where only a name,
@@ -260,9 +488,20 @@ if __name__ == "__main__":
     failures = 0
     for fn in (test_genuine_chain_validates,
                test_name_spoofing_attacker_chain_rejected,
+               test_signature_link_verifies_across_algorithms,
                test_tampered_pin_refuses,
                test_embedded_anchor_loads_and_matches_pin,
-               test_write_trust_anchor_file_materializes_pinned_cert):
+               test_ocsp_good_response_accepted,
+               test_ocsp_revoked_response_rejected,
+               test_ocsp_untrusted_signer_rejected,
+               test_ocsp_delegated_responder_accepted,
+               test_ocsp_stale_response_rejected,
+               test_ocsp_future_response_rejected,
+               test_ocsp_fresh_response_for_past_signing_date_accepted,
+               test_ocsp_revoked_after_signing_still_rejected,
+               test_ocsp_serial_mismatch_rejected,
+               test_intermediate_ocsp_checked_against_pinned_root,
+               test_intermediate_without_ocsp_url_rejected):
         try:
             fn()
             print(f"  PASS  {fn.__name__}")
